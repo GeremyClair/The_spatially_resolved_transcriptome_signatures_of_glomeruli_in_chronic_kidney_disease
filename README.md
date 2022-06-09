@@ -1,5 +1,5 @@
 # Effect_of_glomerular_disease_on_the_podocyte_cell_cycle
- Data analysis of the proteomics for the paper by Hasmik Soloyan et al.
+ Data analysis of the spatially resolved transcriptome for the paper by Hasmik Soloyan et al.
 
 This repository contains the details of the GeoMX data analysis for the paper  titled : “The spatially resolved transcriptome signatures of glomeruli in chronic kidney disease“ by Hasmik Soloyan and collaborators. 
 
