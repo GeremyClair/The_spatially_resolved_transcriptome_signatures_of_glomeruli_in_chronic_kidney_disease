@@ -1,0 +1,2244 @@
+---
+title: "Spatially resolved transcriptome of glomerular diseases - GeoMx code"
+author: "Geremy Clair"
+date: "2023-10-09"
+output: html_document
+---
+
+# Load packages
+
+We will load the required packages needed for the analyses
+```{r setup, include=FALSE}
+library("standR")
+library("ExperimentHub")
+library("edgeR")
+library("SpatialExperiment")
+library("limma")
+library("RomicsProcessor")
+library("proteinminion")
+library("ggpubr")
+library("ggalluvial")
+library("ggvenn")
+library("SLICER")
+library("lle")
+options(repos=structure(c(CRAN="https://mirror.ibcp.fr/pub/CRAN/")))
+knitr::opts_chunk$set(fig.width=10, fig.height=6, echo = TRUE, results = TRUE, warning = FALSE, message=FALSE) 
+```
+
+# data loading
+The files from Nanostring were loaded.
+```{r dataset_load}
+#our dataset
+TargetCountMatrix<-read.csv("01_source_files/ProbeCountMatrix.csv")
+SegmentProperties<-read.csv("01_source_files/SegmentProperties.csv")
+TargetProperties<-read.csv("01_source_files/TargetProperties.csv")
+
+```
+
+# Gene/Protein information
+Using the package 'Protein Mini-on' (Geremy Clair 2023, in prep.), The fasta file was downloaded from Uniprot for Human proteome (non redundant proteins sprot) February 10th, 2023.
+```{r download_fasta}
+if(!file.exists("03_output_files/Uniprot_Homo_sapiens_proteome_UP000005640_2023_06_02.fasta")){
+    download_UniProtFasta(proteomeID = "UP000005640",reviewed = T,export = TRUE, file="./03_output_files/Uniprot_Homo_sapiens_proteome_UP000005640_2023_06_02.fasta")
+}
+UniProtFasta_info_Human<-UniprotFastaParser(file = "03_output_files/Uniprot_Homo_sapiens_proteome_UP000005640_2023_06_02.fasta")
+write.csv(UniProtFasta_info_Human, "03_output_files/UniProtFasta_info_human.csv")
+```
+
+For each entry, 'Protein Mini-On' was use to download Gene Ontology (GO), KEGG ids, and Reactome Ids associated with the proteins. The ontology and pathway tables were also generated to perform enrichment analyzes.
+```{r UniProtTable_download}
+if(file.exists("./03_output_files/UniProtTables.rda")){
+  load(file = "./03_output_files/UniProtTables.rda")
+    }else{
+  generate_UniProtTables(proteomeID = "UP000005640",reviewed = T)
+  save(UniProtTable,UniProtTable_GO,UniProtTable_KEGG,UniProtTable_REACTOME,file =   "./03_output_files/UniProtTables.rda")
+  }
+```
+
+# data cleanup
+The TargetCountMatrix was cleaned up to remove the outliers genes and to include only the probe names as first column and the probe counts.
+A separate table was made for the negative probes only
+```{r TargetCountMatrix_cleanup}
+TargetCountMatrix<-TargetCountMatrix[TargetCountMatrix$GlobalOutlier!=TRUE,]
+TargetCountMatrix$TargetName[TargetCountMatrix$TargetName=="NegProbe"]<-paste0("NegProbe_",TargetCountMatrix$ProbeDisplayName[TargetCountMatrix$TargetName=="NegProbe"])
+TargetCountMatrix<-TargetCountMatrix[,!colnames(TargetCountMatrix) %in% c("ProbeDisplayName","HUGOSymbol", "GlobalOutlier", "GlobalOutlierReason","Gene"  )]
+```
+
+# LOQ method evaluation
+We will first evaluate visually the distribution of the NegProbes and the other probes 
+```{r evaluate_LOI_method}
+print("First we will create boxplots to show the distribution of NEG and POS in each sample")
+#first an object is created
+d<-data.frame(matrix(ncol=5,nrow=0))
+colnames(d)<-c("probe","probe_type","ROI","raw_count","log2_count")
+for (i in 2:ncol(TargetCountMatrix)){
+  t<-data.frame(matrix(ncol=5,nrow=nrow(TargetCountMatrix)))
+  colnames(t)<-c("probe","probe_type","ROI","raw_count","log2_count")
+  t$probe<-TargetCountMatrix[,1]
+  t$probe_type<-rep("RNA",nrow(t))
+  t$probe_type[grepl("NegProbe_",t$probe)]<-"NEG"
+  t$ROI<-colnames(TargetCountMatrix)[i]
+  t$raw_count<-TargetCountMatrix[,i]
+  t$raw_count[t$raw_count==0]<-NA
+  t$log2_count<-log(as.numeric(t$raw_count),base = 2)
+  d<-rbind(d,t)
+  p<-ggplot(t, aes(x=ROI, y=log2_count, fill=probe_type)) +
+  geom_boxplot(position=position_dodge(1),outlier.shape = NA)+
+  #geom_violin(position=position_dodge(1),outlier.shape = NA)+
+  #geom_point(pch = 21, position = position_jitterdodge())+
+    scale_y_continuous(limits = c(0, 7))+
+    ggtitle(colnames(TargetCountMatrix)[i])
+  plot(p)
+}
+# plot the global boxplot
+p<-ggplot(d, aes(x=ROI, y=log2_count, fill=probe_type)) +
+  geom_boxplot(position=position_dodge(1),outlier.shape = NA)+scale_y_continuous(limits = c(0, 7))
+plot(p)
+```
+we will now evaluate the number of genes that can be above LOQ using a variety of methods
+```{r LOQ_eval}
+print("first lets calculate the mean of the NegProbes in each sample")
+NEG<-TargetCountMatrix[grepl("NegProbe_",TargetCountMatrix$TargetName),]
+rownames(NEG)<-NEG$TargetName
+NEG<-NEG[,-1]
+
+Genes<-TargetCountMatrix[!grepl("NegProbe_",TargetCountMatrix$TargetName),]
+rownames(Genes)<-Genes$TargetName
+Genes<-Genes[,-1]
+
+t<-data.frame(matrix(nrow=ncol(NEG),ncol=0))
+rownames(t)<-colnames(NEG)
+t$sample<-colnames(NEG)
+t$mean<-sapply(NEG,mean)
+t$sd<-sapply(NEG,sd)
+
+quantiles<-sapply(NEG,quantile)
+t$quartile_1<-quantiles[2,]
+t$median<-quantiles[3,]
+t$quartile_3<-quantiles[4,]
+t$max<-sapply(NEG,max)
+
+# Per their manual the LOQ formula is the following
+# LOQ = GeoMean(Neg1-n) * GeoStdev(Neg1-n)LOQ Threshold (typically LOQ threshold =2 )
+t$LOQ_Nanostring_threshold3<-t$mean*t$sd^3
+t$LOQ_Nanostring_threshold2<-t$mean*t$sd^2
+t$LOQ_Nanostring_threshold1<-t$mean*t$sd^1
+t$LOQ_Nanostring_threshold05<-t$mean*t$sd^0.5
+
+# calculate LOQ 1sd  and 2sd away from mean
+t$mean_plus_1sd<- t$mean+t$sd
+t$mean_plus_2sd<- t$mean+2*t$sd
+t$mean_plus_2sd<- t$mean+3*t$sd
+
+# calculate LOQ 1sd  and 2sd away from median
+t$median_plus_1sd<- t$median+t$sd
+t$median_plus_2sd<- t$median+2*t$sd
+t$median_plus_3sd<- t$median+3*t$sd
+
+print("now we will count how many genes are passing each column")
+g<-t
+Genes<-t(Genes)
+
+for (i in 1:nrow(g)){
+  for (j in 2:ncol(g)){
+  g[i,j]<-sum(Genes[i,]>t[i,j])
+  }}
+
+
+threshold<-2000
+for(i in 2:ncol(g)){
+p<-ggplot(g,aes(x=g[,i],y=sample))+geom_bar(stat = "identity")+ geom_vline(xintercept=threshold, 
+                color = "red", size=0.5)+ggtitle(label = colnames(g)[i])
+plot(p)
+print(paste0(sum(g[,i]>threshold)," samples had over ",threshold ," probes with value were higher than the ",colnames(g)[i]," of the negative probes"))
+}
+```
+We decided to use the median of the NegProbes plus 3 standard deviations as Limit of Quantification, it retained many genes while being stringent.
+```{r LOQ_filter}
+LOQ<-t$median_plus_3sd
+LOQ<-t(as.data.frame(LOQ))
+colnames(LOQ)<-colnames(NEG)
+rownames(LOQ)<-"LOQ"
+TargetCountMatrix<-rbind(t(Genes),NEG,LOQ)
+countFile_txt<-cbind(TargetName=rownames(TargetCountMatrix),TargetCountMatrix)
+```
+
+We will now import the sample annotation file with the collapsed negative probe
+```{r import_annotation}
+sampleAnnoFile_txt<-read.csv(file = "01_source_files/sampleAnnoFile2.csv")
+LOQ<-t(LOQ)
+colnames(LOQ)<-"LOQ_prenorm"
+sampleAnnoFile_txt<-cbind(sampleAnnoFile_txt,LOQ)
+```
+
+and  read the GeoMx data
+```{r read_geoMx}
+rownames(sampleAnnoFile_txt)<-gsub("\\.","_",sampleAnnoFile_txt$Sample_ID)
+sampleAnnoFile_txt$Sample_ID<-gsub("\\.","_",sampleAnnoFile_txt$Sample_ID)
+sampleAnnoFile_txt$SegmentDisplayName<-gsub("\\.","_",sampleAnnoFile_txt$SegmentDisplayName)
+
+write.table(countFile_txt,file = "03_output_files/00_TargetCountMatrix.txt",sep = "\t",row.names = F)
+write.table(sampleAnnoFile_txt,file = "03_output_files/00_sampleAnnoFile.txt",sep = "\t",row.names = F)
+
+GeoMx_data<-standR::readGeoMx(countFile="01_source_files/TargetCountMatrix_negprobeCollapsed.txt" ,sampleAnnoFile_txt, featureAnnoFile =NA, hasNegProbe = T, NegProbeName = "NegProbe", colnames.as.rownames =c("TargetName","Sample_ID","TargetName"),coord.colnames = c("RoiReportX", "RoiReportY"))
+```
+The metadata was visualized
+```{r metadata_visualization}
+#the region tag is needed in multiple functions and therefore we need to add this to the coldata(GeoMx))
+colData(GeoMx_data)$regions <- paste0(colData(GeoMx_data)$DiseaseGen,"_",colData(GeoMx_data)$Structure)
+colData(GeoMx_data)$region<-colData(GeoMx_data)$regions
+
+plotSampleInfo(GeoMx_data, column2plot = c("SlideName","Structure","regions"))
+
+```
+
+# Visualization of data distribution
+We will check how the log_expression compares by slide name and by disease
+```{r log_express_visualization}
+print("unlog data distribution is shown first")
+plotRLExpr(GeoMx_data, ordannots = "SlideName", assay = 1, col = SlideName)
+plotRLExpr(GeoMx_data, ordannots = "SlideName", assay = 1, col = DiseaseGen)
+plotRLExpr(GeoMx_data, ordannots = "SlideName", assay = 1, col = regions)
+
+print("log data distribution is shown next")
+plotRLExpr(GeoMx_data, ordannots = "SlideName", assay = 2, col =SlideName)
+plotRLExpr(GeoMx_data, ordannots = "SlideName", assay = 2, col = DiseaseGen)
+plotRLExpr(GeoMx_data, ordannots = "SlideName", assay = 2, col = regions)
+```
+
+# Sample grouping pre-normalization
+PCA prenormalization is plotted
+```{r prenorm_grouping}
+drawPCA(GeoMx_data, assay = 2, col = DiseaseGen, shape = Structure)
+plotScreePCA(GeoMx_data, assay = 2, dims = 10)
+plotPairPCA(GeoMx_data, col = DiseaseGen, 
+            shape = Structure, assay = 2)
+plotPCAbiplot(GeoMx_data, n_loadings = 10, assay = 2, col = regions)
+```
+
+as well as the umap
+```{r umap_prenorm}
+GeoMx_data <- scater::runUMAP(GeoMx_data)
+plotDR(GeoMx_data, dimred = "UMAP", col = DiseaseGen, shape = Structure)
+```
+
+# normalization evaluation
+In the standR package, the following normalizations are offered TMM, RPKM, TPM, CPM, upperquartile and sizefactor. 
+Among them, RPKM and TPM required gene length information (add genelength column to the rowData of the object).
+For TMM, upperquartile (high expression quartile3) and sizefactor (number of reads), their normalized factor will be stored their metadata.
+
+## TMM
+we first tested the TMM normalization
+```{r TMM_norm}
+GeoMx_data_TMM<-geomxNorm(GeoMx_data,method = "TMM",log = T)
+plotRLExpr(GeoMx_data_TMM, assay = 2, color = SlideName) + ggtitle("TMM")
+```
+
+TMM normalized data grouping is plotted
+```{r TMM_grouping}
+drawPCA(GeoMx_data_TMM, assay = 2, col = DiseaseGen, shape = Structure)
+plotScreePCA(GeoMx_data_TMM, assay = 2, dims = 10)
+plotPairPCA(GeoMx_data_TMM, col = DiseaseGen, shape = Structure, assay = 2)
+plotPCAbiplot(GeoMx_data_TMM, n_loadings = 10, assay = 2, col = regions)
+```
+
+and the umap
+```{r TMM_umap}
+GeoMx_data_TMM <- scater::runUMAP(GeoMx_data_TMM)
+plotDR(GeoMx_data_TMM, dimred = "UMAP", col = DiseaseGen, shape = Structure)
+```
+
+## CPM 
+we tested the CPM normalization
+```{r CPM_norm}
+GeoMx_data_CPM<-geomxNorm(GeoMx_data,method = "CPM",log = T)
+plotRLExpr(GeoMx_data_CPM, assay = 2, color = SlideName) + ggtitle("CPM")
+```
+
+PCA of CPM normalized data is plotted
+```{r CPM_grouping}
+drawPCA(GeoMx_data_CPM, assay = 2, col = DiseaseGen, shape = Structure)
+plotScreePCA(GeoMx_data_CPM, assay = 2, dims = 10)
+plotPairPCA(GeoMx_data_CPM, col = DiseaseGen, shape = Structure, assay = 2)
+plotPCAbiplot(GeoMx_data_CPM, n_loadings = 10, assay = 2, col = regions)
+```
+
+and the umap
+```{r CPM_umap}
+GeoMx_data_CPM <- scater::runUMAP(GeoMx_data_CPM)
+plotDR(GeoMx_data_CPM, dimred = "UMAP", col = DiseaseGen, shape = Structure)
+```
+
+## upperquartile
+upperquartile (Q3) normalization was tested
+```{r UQ_norm}
+GeoMx_data_upperquartile<-geomxNorm(GeoMx_data,method = "upperquartile",log = T)
+plotRLExpr(GeoMx_data_upperquartile, assay = 2, color = SlideName) + ggtitle("upperquartile")
+```
+
+PCA of UQ normalized data is plotted
+```{r UQ_grouping}
+drawPCA(GeoMx_data_upperquartile, assay = 2, col = DiseaseGen, shape = Structure)
+plotScreePCA(GeoMx_data_upperquartile, assay = 2, dims = 10)
+plotPairPCA(GeoMx_data_upperquartile, col = DiseaseGen, shape = Structure, assay = 2)
+plotPCAbiplot(GeoMx_data_upperquartile, n_loadings = 10, assay = 2, col = regions)
+```
+
+and the umap
+```{r UQ_umap}
+GeoMx_data_upperquartile <- scater::runUMAP(GeoMx_data_upperquartile)
+plotDR(GeoMx_data_upperquartile, dimred = "UMAP", col = DiseaseGen, shape = Structure)
+```
+
+## sizefactor 
+size factor normalization was tested
+```{r SF_norm}
+GeoMx_data_sizefactor<-geomxNorm(GeoMx_data,method = "sizefactor",log = T)
+plotRLExpr(GeoMx_data_sizefactor, assay = 2, color = SlideName) + ggtitle("Sizefactor")
+```
+
+PCA of data post size factor normalization is plotted
+```{r SF_grouping}
+drawPCA(GeoMx_data_sizefactor, assay = 2, col = DiseaseGen, shape = Structure)
+plotScreePCA(GeoMx_data_sizefactor, assay = 2, dims = 10)
+plotPairPCA(GeoMx_data_sizefactor, col = DiseaseGen, shape = Structure, assay = 2)
+plotPCAbiplot(GeoMx_data_sizefactor, n_loadings = 10, assay = 2, col = regions)
+```
+
+Now lets plot the umap
+```{r SF_umap}
+GeoMx_data_sizefactor <- scater::runUMAP(GeoMx_data_sizefactor)
+plotDR(GeoMx_data_sizefactor, dimred = "UMAP", col = DiseaseGen, shape = Structure)
+```
+
+# TMM normalization
+
+looking at the distribution of the data close to normality and centering of the data post normalization we decided to use TMM normalization moving forward. The object was converted into a DE object to be able to obtain the TMM normalized matrix using EdgeR.
+```{r }
+#this function transforms the GeoMX data into a DGE in order to be able to obtain the TMM_normalized data
+spe2dge <- function(spe, norm = NULL){
+  if (!is(spe, "SummarizedExperiment")) 
+    stop("spe is not of the SummarizedExperiment class")
+  if (!requireNamespace("SummarizedExperiment", quietly = TRUE)) 
+    stop("SummarizedExperiment package required but is not installed (or can't be loaded)")
+  if (!("counts" %in% SummarizedExperiment::assayNames(spe))) 
+    stop("spe doesn't contain counts")
+  counts <- SummarizedExperiment::assay(spe, "counts")
+  if (!is.null(rownames(spe))) 
+    rownames(counts) <- rownames(spe)
+  if (!is.null(colnames(spe))) 
+    colnames(counts) <- colnames(spe)
+  genes <- samples <- NULL
+  if (ncol(SummarizedExperiment::colData(spe))) {
+    samples <- as.data.frame(SummarizedExperiment::colData(spe))
+  }
+  if (is(SummarizedExperiment::rowRanges(spe), "GRanges")) 
+    genes <- as.data.frame(SummarizedExperiment::rowRanges(spe))
+  else if (ncol(SummarizedExperiment::rowData(spe))) 
+    genes <- as.data.frame(SummarizedExperiment::rowData(spe))
+  dge <- edgeR::DGEList(counts = counts, samples = samples, genes = genes)
+  
+  if(!is.null(norm)){
+    if (!(norm %in% c("TMM", "upperquartile", "sizefactor"))) {
+      stop("Please make sure norm matched one of the following strings: 
+         TMM, 
+         upperquartile, 
+         sizefactor")
+    } else {
+      dge$samples$norm.factors <- S4Vectors::metadata(spe)$norm.factor
+    }
+  }
+  
+  return(dge)
+}
+
+DGE_TMM<-spe2dge(GeoMx_data_TMM,norm="TMM")
+
+TMM_crosstable<- edgeR::cpm(DGE_TMM)
+write.csv(TMM_crosstable,file="03_output_files/00_TMM_normalized_crosstable.csv")
+```
+
+# Romics data object creation
+The data is now imported as an romics_object for statistical analysis
+```{r romics_object_creation}
+data<-TMM_crosstable
+data<-cbind(rownames(data),data)
+metadata<-t(SegmentProperties[,!grepl("tags",colnames(SegmentProperties))])
+colnames(metadata)<- gsub("\\.","_",metadata[1,])
+metadata<-metadata[-1,]
+metadata<-cbind(rownames(metadata), metadata)
+metadata[,1]<-gsub("\\.","_",metadata[,1])
+metadata<-as.data.frame(metadata)
+
+IDs<-read.csv("01_source_files/uniprot_Mapping_table_simplified.csv")
+
+romics_geomx<-romicsCreateObject(data,metadata,main_factor = "structure_disease_age",IDs = IDs)
+
+#zero values are not transformable in log2 transformation those values were noted as NA
+romics_geomx<-romicsZeroToMissing(romics_geomx)
+romics_geomx<-log2transform(romics_geomx)
+
+#missing values were imputed with 0
+romics_geomx$data[is.na(romics_geomx$data)]<-0
+#distribBoxplot(romics_geomx)
+```
+
+How we will check how the data is distributed
+```{r data_distribution}
+indPCAplot(romics_geomx,Xcomp = 1,Ycomp = 2,plotType = "individual",label = T)
+```
+
+it seems like there are outliers in the data, we will perform an outlier detection to evaluate and remove technical outliers
+```{r outlier_removal}
+romicsOutlierEval(romics_geomx,pvalue_threshold = 0.00001)
+romicsOutlierEval(romics_geomx,pvalue_threshold = 0.00001,metrics =c("Correlation","Proportion_Missing","MAD"))
+romicsOutlierEval(romics_geomx,pvalue_threshold = 0.00001,metrics =c("Correlation","Proportion_Missing","Skewness"))
+romicsOutlierEval(romics_geomx,pvalue_threshold = 0.00001,metrics =c("Correlation","Proportion_Missing","Skewness","MAD"))
+romics_geomx<-romicsOutlierRemove(romics_geomx,pvalue_threshold = 0.00001)
+indPCAplot(romics_geomx,Xcomp = 1,Ycomp = 2,plotType = "individual",label = T)
+```
+
+We removed the ROI classified as tubule DSP.1012550001423.D10 which was in fact selected to contain both tubule and glomerular regions.
+```{r}
+romics_geomx<-romicsSubset(romics_geomx,subset_vector = "DSP_1012550001423_D10", type = "drop",by = "colnames")
+indPCAplot(romicsSampleNameFromFactor(romics_geomx,factor = "disease_gen_ROI"),Xcomp = 1,Ycomp = 2,plotType = "individual",label = T)
+```
+
+# export table for deconvolution and dynamic range plot
+The table was exported to generate a deconvolution and range plot
+
+```{r}
+table<- romicsSampleNameFromFactor(romicsChangeFactor(romics_geomx,main_factor = "structure_disease_age"),factor = "disease_gen_ROI")$data
+f<-romicsExtractFactor(romicsSampleNameFromFactor(romicsChangeFactor(romics_geomx,main_factor = "structure_disease_age"),factor = "disease_gen_ROI"),factor = "structure_disease_age")
+
+average<-rowSums(table)/ncol(table)
+table<-table[order(average,decreasing = T),]
+
+f<-t(as.data.frame(f))
+
+write.csv(rbind(f,table),file="03_output_files/00_log2_TMM_normalized.csv")
+```
+
+We will now use the LOQ to indicate the missingness in the data
+```{r below_LOQ_removal}
+romicsMissingFromLOQ<-function(romics_object,LOQ_name="LOQ"){
+m<-romics_object$missingdata
+d<-romics_object$data
+LOQ<-d[rownames(d)==LOQ_name,]
+d<-d[rownames(d)!=LOQ_name,]
+imputed<-d
+m<-m[rownames(m)!=LOQ_name,]
+
+for(i in 1:ncol(d)){
+  m[,i]<-d[,i]<=as.numeric(LOQ[i])
+  d[m[,i],i]<-NA
+}
+
+romics_object$data<-d
+romics_object$missingdata<-m
+romics_object$imputed<-imputed
+return(romics_object)
+}
+
+romics_geomx<-romicsMissingFromLOQ(romics_geomx,"LOQ")
+```
+
+we will evaluate the number of values above the LOQ
+```{r Above_LOQ_evaluation}
+above_LOQ<-!romics_geomx$missingdata
+number_segment<-ncol(above_LOQ)
+#gene detected in at least one LOQ
+Count_segments<-rowSums(above_LOQ)
+Percent_segment_1percent<-sum(Count_segments>1*number_segment/100)
+Percent_segment_5percent<-sum(Count_segments>5*number_segment/100)
+Percent_segment_10percent<-sum(Count_segments>10*number_segment/100)
+Percent_segment_20percent<-sum(Count_segments>20*number_segment/100)
+Percent_segment_30percent<-sum(Count_segments>30*number_segment/100)
+Percent_segment_40percent<-sum(Count_segments>40*number_segment/100)
+Percent_segment_50percent<-sum(Count_segments>50*number_segment/100)
+Percent_segment_60percent<-sum(Count_segments>60*number_segment/100)
+Percent_segment_70percent<-sum(Count_segments>70*number_segment/100)
+Percent_segment_80percent<-sum(Count_segments>80*number_segment/100)
+Percent_segment_90percent<-sum(Count_segments>90*number_segment/100)
+Percent_segment_100percent<-sum(Count_segments>=100*number_segment/100)
+
+percent_table<-data.frame(percent_segment=c("001%","005%","010%","020%","030%","040%","050%","060%","070%","080%","090%","100%"),
+           Gene_detected=c(Percent_segment_1percent,
+                           Percent_segment_5percent,
+                           Percent_segment_10percent,
+                           Percent_segment_20percent,
+                           Percent_segment_30percent,
+                           Percent_segment_40percent,
+                           Percent_segment_50percent,
+                           Percent_segment_60percent,
+                           Percent_segment_70percent,
+                           Percent_segment_80percent,
+                           Percent_segment_90percent,
+                           Percent_segment_100percent
+                           ))
+
+ggplot(percent_table,aes(percent_segment,Gene_detected, fill=percent_segment))+
+  geom_bar(stat="identity")+
+  geom_text(aes(label=Gene_detected), position=position_dodge(width=0.9), vjust=-0.25)+
+  theme_ROP()
+```
+
+# ROI structure types differences
+
+We first wanted to evaluate what were the major structure difference (glomeruli vs tubules) in terms of ROI transcriptomics
+The factor was changed for the Structure
+The data will be filtered so only RNA with at least 50% of complete data for one sample group is conserved (either tubules or glomeruli).
+```{r structure_subset_creation}
+romics_structure<-romicsFilterMissing(romicsChangeFactor(romics_geomx,main_factor = "structure"), percentage_completeness = 50)
+```
+
+hclustering was plotted.
+```{r Global_Hclust_structure}
+romicsHclust(romics_structure)
+romicsHclust(romicsChangeFactor(romics_structure,main_factor = "disease_gen_structure"))
+```
+
+PCA plots were generated.
+```{r Structure_PCA}
+imputeMissingEval(romics_structure,nb_stdev = 2,width_stdev = 0.5)
+romics_structure_imp<-imputeMissing(romics_structure,nb_stdev = 2,width_stdev = 0.5)
+
+indPCAplot(romics_structure_imp,label = F,Xcomp = 1,Ycomp = 2,plotType = "individual")
+indPCAplot(romics_structure_imp,label = F,Xcomp = 1,Ycomp = 3,plotType = "individual")
+indPCA3D(romics_structure_imp,label = F,Xcomp = 1,Ycomp = 2,plotType = "individual")
+
+indPCAplot(romicsSampleNameFromFactor(romics_structure_imp,factor = "disease_gen_ROI"),label = T,Xcomp = 1,Ycomp = 2,plotType = "individual")
+indPCAplot(romicsChangeFactor(romicsSampleNameFromFactor(romics_structure_imp,factor = "disease_gen_ROI"),main_factor = "disease_gen_structure"),label = T,Xcomp = 1,Ycomp = 2,plotType = "individual")
+
+indPCA3D(romicsChangeFactor(romicsSampleNameFromFactor(romics_structure_imp,factor = "disease_gen_ROI"),main_factor = "disease_gen_structure"))
+
+indPCA3D(romics_structure_imp, Xcomp = 1,Ycomp = 2,Zcomp = 3)
+
+PCA_structure<-romicsPCA(romicsChangeIDs(romics_structure_imp,newIDs = "Uniprot_accession"))
+
+PCA_contrib<-as.data.frame(PCA_structure$var$contrib)
+write.csv(PCA_contrib,file="03_output_files/01_PCA_contrib_structure_tubules_vs_glomeruli.csv")
+
+universe <- rownames(PCA_contrib)
+
+print("For the PC1 and PC2 the top 10% transcript contributing to the separation were extracted")
+
+PC1_10percent <- PCA_contrib[order(PCA_contrib[,1],decreasing = T),]
+PC1_10percent <- rownames(PC1_10percent)[1:ceiling(nrow(PC1_10percent)/10)]
+
+PC2_10percent <- PCA_contrib[order(PCA_contrib[,2],decreasing = T),]
+PC2_10percent <- rownames(PC2_10percent)[1:ceiling(nrow(PC2_10percent)/10)]
+
+PC3_10percent <- PCA_contrib[order(PCA_contrib[,3],decreasing = T),]
+PC3_10percent <- rownames(PC3_10percent)[1:ceiling(nrow(PC3_10percent)/10)]
+
+print("Enrichment analysis were then performed")
+
+PC1_10percent_enr<-cbind(component="PC1",Enrich_EASE(PC1_10percent,universe))
+PC2_10percent_enr<-cbind(component="PC2",Enrich_EASE(PC2_10percent,universe))
+PC3_10percent_enr<-cbind(component="PC3",Enrich_EASE(PC3_10percent,universe))
+
+PCA_structure_enr<- enrfilter(rbind(PC1_10percent_enr, PC2_10percent_enr, PC3_10percent_enr),pval_type = "pval",foldchange = 1,min_feature = 2)
+
+DT::datatable(PCA_structure_enr)
+
+write.table(PCA_structure_enr, file="./03_output_files/02_PCA_enrichments_structure_tubules_vs_glomeruli.txt",sep = "\t",row.names = F)
+```
+
+## Expression change in glomeruli vs tubules
+
+ANOVA was performed, Heatmap was plotted, expected markers of Glomeruli and Tubules were checked for their localization.
+binomial gml test were performed. as well as ttests
+```{r structure_statistics}
+romics_structure<-romicsMean(romics_structure)
+romics_structure<-romicsSd(romics_structure)
+romics_structure<-romicsZscores(romics_structure)
+romics_structure<-romicsANOVA(romics_structure)
+romics_structure<-romicsGlmBinomial(romics_structure)
+romics_structure<-romicsTtest(romics_structure,var.equal = F,percentage_completeness = 50)
+
+pFrequencyPlot(romics_structure)
+
+romicsHeatmap(romics_structure,sample_hclust = T,ANOVA_filter = "padj" ,p = 0.05,variable_hclust_number = 5)
+
+romics_structure<- romicsVariableHclust(romics_structure, clusters = 5,ANOVA_filter = "padj" ,p = 0.05,plot=F)
+
+romicsVolcano(romics_structure,p_type = "padj",min_fold_change = 0)
+
+#PODXL
+singleVariablePlot(romics_structure,variable = "PODXL")+
+  geom_bracket(xmin = "Glomeruli", xmax = "Tubules", y.position = 12, label = formatC(romics_structure$statistics$Tubules_vs_Glomeruli_glmBionomialTest_padj[rownames(romics_structure$statistics)=="PODXL"], format = "e"))
+
+print(paste0("ANOVA_adjp = ",romics_structure$statistics$Tubules_vs_Glomeruli_glmBionomialTest_padj[rownames(romics_structure$statistics)=="PODXL"]))
+print(paste0("gmlBinomial_adjp = ",romics_structure$statistics$Tubules_vs_Glomeruli_glmBionomialTest_padj[rownames(romics_structure$statistics)=="PODXL"]))
+
+#SYNPO
+singleVariablePlot(romics_structure,variable = "SYNPO")+
+  geom_bracket(xmin = "Glomeruli", xmax = "Tubules", y.position = 10, label = formatC(romics_structure$statistics$Tubules_vs_Glomeruli_glmBionomialTest_padj[rownames(romics_structure$statistics)=="SYNPO"], format = "e"))
+
+print(paste0("ANOVA_adjp = ",romics_structure$statistics$Tubules_vs_Glomeruli_glmBionomialTest_padj[rownames(romics_structure$statistics)=="SYNPO"]))
+print(paste0("gmlBinomial_adjp = ",romics_structure$statistics$Tubules_vs_Glomeruli_glmBionomialTest_padj[rownames(romics_structure$statistics)=="SYNPO"]))
+
+#EHD3
+singleVariablePlot(romics_structure,variable = "EHD3")+
+  geom_bracket(xmin = "Glomeruli", xmax = "Tubules", y.position = 10, label = formatC(romics_structure$statistics$Tubules_vs_Glomeruli_glmBionomialTest_padj[rownames(romics_structure$statistics)=="EHD3"], format = "e"))
+
+print(paste0("ANOVA_adjp = ",romics_structure$statistics$Tubules_vs_Glomeruli_glmBionomialTest_padj[rownames(romics_structure$statistics)=="EHD3"]))
+print(paste0("gmlBinomial_adjp = ",romics_structure$statistics$Tubules_vs_Glomeruli_glmBionomialTest_padj[rownames(romics_structure$statistics)=="EHD3"]))
+
+#HPN
+singleVariablePlot(romics_structure,variable = "HPN")+
+  geom_bracket(xmin = "Glomeruli", xmax = "Tubules", y.position = 7, label = formatC(romics_structure$statistics$Tubules_vs_Glomeruli_glmBionomialTest_padj[rownames(romics_structure$statistics)=="HPN"], format = "e"))
+
+print(paste0("ANOVA_adjp = ",romics_structure$statistics$Tubules_vs_Glomeruli_glmBionomialTest_padj[rownames(romics_structure$statistics)=="HPN"]))
+print(paste0("gmlBinomial_adjp = ",romics_structure$statistics$Tubules_vs_Glomeruli_glmBionomialTest_padj[rownames(romics_structure$statistics)=="HPN"]))
+
+#CDH16
+singleVariablePlot(romics_structure,variable = "CDH16")+
+  geom_bracket(xmin = "Glomeruli", xmax = "Tubules", y.position = 8, label = formatC(romics_structure$statistics$Tubules_vs_Glomeruli_glmBionomialTest_padj[rownames(romics_structure$statistics)=="CDH16"], format = "e"))
+
+print(paste0("ANOVA_adjp = ",romics_structure$statistics$Tubules_vs_Glomeruli_glmBionomialTest_padj[rownames(romics_structure$statistics)=="CDH16"]))
+print(paste0("gmlBinomial_adjp = ",romics_structure$statistics$Tubules_vs_Glomeruli_glmBionomialTest_padj[rownames(romics_structure$statistics)=="CDH16"]))
+
+#TMEM37
+singleVariablePlot(romics_structure,variable = "TMEM37")+
+  geom_bracket(xmin = "Glomeruli", xmax = "Tubules", y.position = 7, label = formatC(romics_structure$statistics$Tubules_vs_Glomeruli_glmBionomialTest_padj[rownames(romics_structure$statistics)=="TMEM37"], format = "e"))
+
+print(paste0("ANOVA_adjp = ",romics_structure$statistics$Tubules_vs_Glomeruli_glmBionomialTest_padj[rownames(romics_structure$statistics)=="TMEM37"]))
+print(paste0("gmlBinomial_adjp = ",romics_structure$statistics$Tubules_vs_Glomeruli_glmBionomialTest_padj[rownames(romics_structure$statistics)=="TMEM37"]))
+
+results_structure <- romicsExportData(romics_structure,statistics = T,missing_data = T,IDs = T)
+
+write.csv(results_structure,file = "03_output_files/03_stats_structure_tubules_vs_glomeruli.csv")
+```
+
+## Enrichment analysis
+
+For the GLM bionmial test and ttests, the enrichment analysis will be done to identify structure enriched ontologies.
+up in tubule comprises the genes either qualitatively (glmBinomial test) or quantitatively (T.test) higher in tubules vs glomeruli (padj<0.05)
+```{r structure_enrichment}
+romics_structure_uniprot<-romicsChangeIDs(romics_structure,newIDs = "Uniprot_accession")
+universe<-rownames(romics_structure_uniprot$statistics)
+
+up_in_tubules<- rownames(romics_structure_uniprot$statistics)[(romics_structure_uniprot$statistics$Tubules_vs_Glomeruli_glmBionomialTest_padj<0.05&
+                                                                 romics_structure_uniprot$statistics$Tubules_vs_Glomeruli_directionality==1) |
+                                                                (!is.na(romics_structure_uniprot$statistics$Tubules_vs_Glomeruli_Ttest_padj)&
+                                                                  romics_structure_uniprot$statistics$Tubules_vs_Glomeruli_Ttest_padj<0.05&
+                                                                   romics_structure_uniprot$statistics$`log(Tubules/Glomeruli)`>0)]
+
+up_in_glomeruli<-rownames(romics_structure_uniprot$statistics)[(romics_structure_uniprot$statistics$Tubules_vs_Glomeruli_glmBionomialTest_padj<0.05&
+                                                                  romics_structure_uniprot$statistics$Tubules_vs_Glomeruli_directionality==-1) |
+                                                                (!is.na(romics_structure_uniprot$statistics$Tubules_vs_Glomeruli_Ttest_padj)&
+                                                                   romics_structure_uniprot$statistics$Tubules_vs_Glomeruli_Ttest_padj<0.05&
+                                                                    romics_structure_uniprot$statistics$`log(Tubules/Glomeruli)`<0)]
+
+up_glom<- up_in_glomeruli[!up_in_glomeruli %in% up_in_tubules]
+up_tub<- up_in_tubules[!up_in_tubules %in% up_in_glomeruli]
+
+up_in_tubules_enr<-cbind(category="up_in_tubules",enrfilter(Enrich_EASE(up_in_tubules,universe),pval_type = "pval",foldchange = 1,min_feature = 2))
+up_in_glomeruli_enr<-cbind(category="up_in_glomeruli",enrfilter(Enrich_EASE(up_in_glomeruli,universe),pval_type = "pval",foldchange = 1,min_feature = 2))
+
+enrichment_structures<-rbind(up_in_tubules_enr,up_in_glomeruli_enr)
+  
+write.table(enrichment_structures,file = "03_output_files/04_enrichment_structure_tubules_vs_glomeruli.txt",sep="\t",row.names = F)
+```
+
+# All glomeruli 
+
+we will generate a subset comprising only the glomeruli for all groups
+```{r Subsetting_glomeruli}
+romics_glomeruli<-romicsSubset(romics_geomx, subset_vector ="Glomeruli" ,type = "keep", factor = "structure",by = "level")
+```
+
+The data was filtered to contain at least 50% of values for a given group
+```{r missingness_filtering_glomeruli}
+romics_glomeruli<-romicsFilterMissing(romics_glomeruli,percentage_completeness = 50)
+```
+
+The sample grouping was checked by h-clustering
+```{r Hclust_glomeruli}
+romicsHclust(romics_glomeruli)
+```
+
+and then by PCA
+```{r PCA_glomeruli}
+#to perform the PCA, missing value need to be imputed
+imputeMissingEval(romics_glomeruli,nb_stdev = 2,width_stdev = 0.5)
+romics_glomeruli_imp<-imputeMissing(romics_glomeruli,nb_stdev = 2,width_stdev = 0.5)
+
+indPCAplot(romics_glomeruli_imp,label = F,Xcomp = 1,Ycomp = 2,plotType = "individual")
+indPCAplot(romics_glomeruli_imp,label = F,Xcomp = 1,Ycomp = 3,plotType = "individual")
+indPCA3D(romics_glomeruli_imp,label = F)
+
+indPCA3D(romics_glomeruli_imp, Xcomp = 1,Ycomp = 2,Zcomp = 3)
+
+PCA_glomeruli<-romicsPCA(romicsChangeIDs(romics_glomeruli_imp,newIDs = "Uniprot_accession"))
+
+PCA_contrib<-as.data.frame(PCA_glomeruli$var$contrib)
+write.csv(PCA_contrib,file="03_output_files/05_PCA_contributions_all_glomeruli.csv")
+
+universe <- rownames(PCA_contrib)
+
+print("For the PC1 and PC2 the top 10% transcript contributing to the separation were extracted")
+
+PC1_10percent <- PCA_contrib[order(PCA_contrib[,1],decreasing = T),]
+PC1_10percent <- rownames(PC1_10percent)[1:ceiling(nrow(PC1_10percent)/10)]
+
+PC2_10percent <- PCA_contrib[order(PCA_contrib[,2],decreasing = T),]
+PC2_10percent <- rownames(PC2_10percent)[1:ceiling(nrow(PC2_10percent)/10)]
+
+PC3_10percent <- PCA_contrib[order(PCA_contrib[,3],decreasing = T),]
+PC3_10percent <- rownames(PC3_10percent)[1:ceiling(nrow(PC3_10percent)/10)]
+
+print("Enrichment analysis were then performed")
+
+PC1_10percent_enr<-cbind(component="PC1",Enrich_EASE(PC1_10percent,universe))
+PC2_10percent_enr<-cbind(component="PC2",Enrich_EASE(PC2_10percent,universe))
+PC3_10percent_enr<-cbind(component="PC3",Enrich_EASE(PC3_10percent,universe))
+
+PCA_glomeruli_enr<- enrfilter(rbind(PC1_10percent_enr, PC2_10percent_enr, PC3_10percent_enr),pval_type = "pval",foldchange = 1,min_feature = 2)
+
+DT::datatable(PCA_glomeruli_enr)
+
+write.table(PCA_glomeruli_enr, file="./03_output_files/06_PCA_enrichment_all_glomeruli.txt",sep = "\t",row.names = F)
+```
+
+General statistics were performed
+```{r general_statistics_glomeruli}
+romics_glomeruli<-romicsMean(romics_glomeruli)
+romics_glomeruli<-romicsSd(romics_glomeruli)
+romics_glomeruli<-romicsZscores(romics_glomeruli)
+romics_glomeruli<-romicsANOVA(romics_glomeruli)
+romics_glomeruli<-romicsGlmBinomial(romics_glomeruli)
+romics_glomeruli<-romicsTtest(romics_glomeruli,var.equal = F,percentage_completeness = 50,reverse_order = T)
+romics_glomeruli<-romicsTtest(romics_glomeruli,var.equal = F,percentage_completeness = 50,reverse_order = F)
+```
+
+The volcano plots were displayed
+```{r volcanoes_glomeruli}
+romicsVolcano(romics_glomeruli,p_type = "padj")
+```
+
+examples of genes with the highest pval (anova or ttest or glm binomial)
+```{r specific_transcripts_glomeruli}
+Figs<-romics_glomeruli
+singleVariablePlot(romics_glomeruli,variable = "TMEM30A",pval = "padj")
+singleVariablePlot(romics_glomeruli,variable = "HOXB8",pval = "padj")
+singleVariablePlot(romics_glomeruli,variable = "IL4I1",pval = "padj")
+singleVariablePlot(romics_glomeruli,variable = "MTRNR2L4",pval = "padj")
+singleVariablePlot(romics_glomeruli,variable = "GCK",pval = "padj")
+singleVariablePlot(romics_glomeruli,variable = "ZNF468",pval = "padj")
+singleVariablePlot(romics_glomeruli,variable = "TMA7",pval = "padj")
+singleVariablePlot(romics_glomeruli,variable = "MIA",pval = "padj")
+singleVariablePlot(romics_glomeruli,variable = "MAJIN",pval = "padj")
+singleVariablePlot(romics_glomeruli,variable = "MTRNR2L4",pval = "padj")
+singleVariablePlot(romics_glomeruli,variable = "AAMP",pval = "padj")
+singleVariablePlot(romics_glomeruli,variable = "SPARC",pval = "padj")
+singleVariablePlot(romics_glomeruli,variable = "WNT8A",pval = "padj")
+singleVariablePlot(romics_glomeruli,variable = "ITGA3",pval = "padj")
+singleVariablePlot(romics_glomeruli,variable = "HSPB8",pval = "padj")
+singleVariablePlot(romics_glomeruli,variable = "CLIC3",pval = "padj")
+singleVariablePlot(romics_glomeruli,variable = "CTNND2",pval = "padj")
+singleVariablePlot(romics_glomeruli,variable = "NR1D1",pval = "padj")
+singleVariablePlot(romics_glomeruli,variable = "LRRC17",pval = "padj")
+```
+
+For this subset we performed a trajectory analysis using the package SLICER
+```{r Trajectory_glomeruli}
+table_glomeruli<-t(romicsSampleNameFromFactor(romics_glomeruli_imp,factor = "disease_gen_ROI")$data)
+
+genes <- select_genes(table_glomeruli)
+k = select_k(table_glomeruli[,genes], kmin=5)
+traj_lle = lle(table_glomeruli[,genes], m=2, k)$Y
+
+print("the points of the trajectory are plotted")
+
+traj_graph = conn_knn_graph(traj_lle,5)
+ends = find_extreme_cells(traj_graph, traj_lle)
+start = 1
+
+print("The trajectory connections were plotted")
+
+distances = graph_process_distance(traj_graph,embedding = traj_lle,start = 1)
+
+traj_lle_for_graph = as.data.frame(traj_lle)
+colnames(traj_lle_for_graph) = c("Manifold_dim_1","Manifold_dim_2")
+traj_lle_for_graph$Manifold_dim_1 = as.numeric(traj_lle_for_graph$Manifold_dim_1)
+traj_lle_for_graph$Manifold_dim_2 = as.numeric(traj_lle_for_graph$Manifold_dim_2)
+traj_lle_for_graph<- cbind(ROI= rownames(table_glomeruli), disease_gen= t(romics_glomeruli_imp$metadata[10,]), traj_lle_for_graph, branches =  assign_branches(traj_graph,start = 1))
+
+print("The plots is colored by condition")
+
+traj_lle_for_graph<-cbind(traj_lle_for_graph,data.frame(disease_age_structure=t(romics_glomeruli_imp$metadata[14,])))
+
+ggplot(traj_lle_for_graph,aes(x=Manifold_dim_1,Manifold_dim_2,color=structure_disease_age))+ geom_point(size=1,)+ geom_text(label=traj_lle_for_graph$ROI)+theme_ROP()
+
+DT::datatable(traj_lle_for_graph)
+```
+
+## data export
+The data was exported for the glomeruli results
+```{r data_export_glomeruli}
+results_glomeruli<-romicsExportData(romics_glomeruli,statistics = T,missing_data = T,IDs = T)
+write.csv(results_glomeruli,file = "03_output_files/07_results_glomeruli_non_imputed.csv")
+```
+
+# Young glomeruli
+We will generate a subset comprising only the glomeruli for young donors (normal and diseased).
+```{r Subsetting_glomeruli_young}
+romics_glomeruli_young<-romicsSubset(romics_geomx, subset_vector =c("Glomeruli_Alport_Young","Glomeruli_Normal_Young") ,type = "keep", factor = "structure_disease_age",by = "level")
+```
+
+The data was filtered to contain at least 50% of values for a given group
+```{r missingness_filtering_glomeruli_young}
+romics_glomeruli_young<-romicsFilterMissing(romics_glomeruli_young,percentage_completeness = 50)
+```
+
+The sample grouping was checked by h-clustering
+```{r Hclust_glomeruli_young}
+romicsHclust(romics_glomeruli_young)
+```
+
+and then by PCA
+```{r PCA_glomeruli_young}
+#to perform the PCA, missing value need to be imputed
+imputeMissingEval(romics_glomeruli_young,nb_stdev = 2,width_stdev = 0.5)
+romics_glomeruli_young_imp<-imputeMissing(romics_glomeruli_young,nb_stdev = 2,width_stdev = 0.5)
+
+indPCAplot(romics_glomeruli_young_imp,label = F,Xcomp = 1,Ycomp = 2,plotType = "individual")
+indPCAplot(romics_glomeruli_young_imp,label = F,Xcomp = 1,Ycomp = 3,plotType = "individual")
+indPCA3D(romics_glomeruli_young_imp)
+
+indPCA3D(romics_glomeruli_young_imp, Xcomp = 1,Ycomp = 2,Zcomp = 3)
+
+PCA_glomeruli_young<-romicsPCA(romicsChangeIDs(romics_glomeruli_young_imp,newIDs = "Uniprot_accession"))
+
+PCA_contrib<-as.data.frame(PCA_glomeruli_young$var$contrib)
+write.csv(PCA_contrib,file="03_output_files/08_PCA_contributions_all_glomeruli_young.csv")
+
+universe <- rownames(PCA_contrib)
+
+print("For the PC1 and PC2 the top 10% transcript contributing to the separation were extracted")
+
+PC1_10percent <- PCA_contrib[order(PCA_contrib[,1],decreasing = T),]
+PC1_10percent <- rownames(PC1_10percent)[1:ceiling(nrow(PC1_10percent)/10)]
+
+PC2_10percent <- PCA_contrib[order(PCA_contrib[,2],decreasing = T),]
+PC2_10percent <- rownames(PC2_10percent)[1:ceiling(nrow(PC2_10percent)/10)]
+
+PC3_10percent <- PCA_contrib[order(PCA_contrib[,3],decreasing = T),]
+PC3_10percent <- rownames(PC3_10percent)[1:ceiling(nrow(PC3_10percent)/10)]
+
+print("Enrichment analysis were then performed")
+
+PC1_10percent_enr<-cbind(component="PC1", Enrich_EASE(PC1_10percent,universe))
+PC2_10percent_enr<-cbind(component="PC2",Enrich_EASE(PC2_10percent,universe))
+PC3_10percent_enr<-cbind(component="PC3",Enrich_EASE(PC3_10percent,universe))
+
+  
+PCA_glomeruli_young_enr<- enrfilter(rbind(PC1_10percent_enr, PC2_10percent_enr, PC3_10percent_enr),pval_type = "pval",foldchange = 1,min_feature = 2)
+
+DT::datatable(PCA_glomeruli_young_enr)
+
+write.table(PCA_glomeruli_young_enr, file="./03_output_files/09_PCA_enrichment_all_glomeruli_young.txt",sep = "\t",row.names = F)
+```
+
+General statistics were performed
+```{r general_statistics_glomeruli_young}
+romics_glomeruli_young<-romicsMean(romics_glomeruli_young)
+romics_glomeruli_young<-romicsSd(romics_glomeruli_young)
+romics_glomeruli_young<-romicsZscores(romics_glomeruli_young)
+romics_glomeruli_young<-romicsANOVA(romics_glomeruli_young)
+romics_glomeruli_young<-romicsGlmBinomial(romics_glomeruli_young)
+romics_glomeruli_young<-romicsTtest(romics_glomeruli_young,var.equal = F,percentage_completeness = 50)
+romics_glomeruli_young<-romicsTtest(romics_glomeruli_young,var.equal = F,percentage_completeness = 50,reverse_order = T)
+```
+
+The volcano plots were displayed
+```{r volcanoes_glomeruli_young}
+romicsVolcano(romics_glomeruli_young,p_type = "padj",min_fold_change = 0,p = 0.05,plot = 2, plot_type = "ggplot")
+```
+
+enrichment analysis was performed to compare alport and normal in the young group
+```{r enrichment_glomeruli_young}
+romics_glomeruli_young_Uniprot<-romicsChangeIDs(romics_glomeruli_young,newIDs = "Uniprot_accession")
+
+universe<-rownames(romics_glomeruli_young_Uniprot$statistics)
+
+up_AS_young<-rownames(romics_glomeruli_young_Uniprot$statistics)[(
+  romics_glomeruli_young_Uniprot$statistics$Glomeruli_Normal_Young_vs_Glomeruli_Alport_Young_glmBionomialTest_padj<0.05&
+    romics_glomeruli_young_Uniprot$statistics$Glomeruli_Normal_Young_vs_Glomeruli_Alport_Young_directionality==-1)|
+    (!is.na(romics_glomeruli_young_Uniprot$statistics$Glomeruli_Alport_Young_vs_Glomeruli_Normal_Young_Ttest_padj)& romics_glomeruli_young_Uniprot$statistics$Glomeruli_Alport_Young_vs_Glomeruli_Normal_Young_Ttest_padj<0.05&
+       romics_glomeruli_young_Uniprot$statistics$`log(Glomeruli_Alport_Young/Glomeruli_Normal_Young)`>0)]
+
+down_AS_young<-rownames(romics_glomeruli_young_Uniprot$statistics)[(
+  romics_glomeruli_young_Uniprot$statistics$Glomeruli_Normal_Young_vs_Glomeruli_Alport_Young_glmBionomialTest_padj<0.05&
+    romics_glomeruli_young_Uniprot$statistics$Glomeruli_Normal_Young_vs_Glomeruli_Alport_Young_directionality==1)|
+    (!is.na(romics_glomeruli_young_Uniprot$statistics$Glomeruli_Alport_Young_vs_Glomeruli_Normal_Young_Ttest_padj)& romics_glomeruli_young_Uniprot$statistics$Glomeruli_Alport_Young_vs_Glomeruli_Normal_Young_Ttest_padj<0.05&
+       romics_glomeruli_young_Uniprot$statistics$`log(Glomeruli_Alport_Young/Glomeruli_Normal_Young)`<0)]
+
+#we will now eliminate the gene present in both lists (ambigous calls)
+up<-up_AS_young[!up_AS_young %in% down_AS_young]
+down<-down_AS_young[!down_AS_young %in% up_AS_young]
+
+up_AS_young<-cbind(enriched_in= "up_in_AS_young",Enrich_EASE(up,universe))
+down_AS_young<-cbind(enriched_in= "down_in_AS_young",Enrich_EASE(down,universe))
+
+write.table(up_AS_young,file = "03_output_files/12_up_AS_young.txt",sep = "\t",row.names = F)
+write.table(down_AS_young,file = "03_output_files/13_down_AS_young.txt",sep = "\t",row.names = F)
+
+
+enrichment_AS_young<-enrfilter(rbind(up_AS_young,down_AS_young),pval_type = "pval", pval = 0.05,foldchange = 1,min_feature = 2)
+
+write.table(enrichment_AS_young,file = "03_output_files/10_enrichment_AS_young.txt",sep = "\t",row.names = F)
+```
+
+examples of genes with the highest pval (anova or ttest or glm binomial)
+```{r specific_transcripts_glomeruli_young}
+Figs<-romics_glomeruli_young
+singleVariablePlot(romics_glomeruli_young,variable = "IL4I1",pval = "padj")
+singleVariablePlot(romics_glomeruli_young,variable = "TXN2",pval = "padj")
+singleVariablePlot(romics_glomeruli_young,variable = "MELTF",pval = "padj")
+singleVariablePlot(romics_glomeruli_young,variable = "IFI6",pval = "padj")
+singleVariablePlot(romics_glomeruli_young,variable = "CCDC24",pval = "padj")
+singleVariablePlot(romics_glomeruli_young,variable = "PRMT8",pval = "padj")
+singleVariablePlot(romics_glomeruli_young,variable = "SFXN3",pval = "padj")
+singleVariablePlot(romics_glomeruli_young,variable = "ZNF468",pval = "padj")
+singleVariablePlot(romics_glomeruli_young,variable = "ZNF763",pval = "padj")
+singleVariablePlot(romics_glomeruli_young,variable = "SARS1",pval = "padj")
+singleVariablePlot(romics_glomeruli_young,variable = "ADAMTS13",pval = "padj")
+singleVariablePlot(romics_glomeruli_young,variable = "HOXB8",pval = "padj")
+singleVariablePlot(romics_glomeruli_young,variable = "MTRNR2L4",pval = "padj")
+singleVariablePlot(romics_glomeruli_young,variable = "GCK",pval = "padj")
+singleVariablePlot(romics_glomeruli_young,variable = "TMA7",pval = "padj")
+singleVariablePlot(romics_glomeruli_young,variable = "SPARC",pval = "padj")
+singleVariablePlot(romics_glomeruli_young,variable = "WNT8A",pval = "padj")
+singleVariablePlot(romics_glomeruli_young,variable = "CLIC3",pval = "padj")
+singleVariablePlot(romics_glomeruli_young,variable = "ITGA3",pval = "padj")
+```
+
+For this subset we performed a trajectory analysis using the package SLICER
+```{r Trajectory_glomeruli_young_young}
+table_glomeruli_young<-t( romicsSampleNameFromFactor(romics_glomeruli_young_imp,factor = "disease_gen_ROI")$data)
+genes <- select_genes(table_glomeruli_young)
+k = select_k(table_glomeruli_young[,genes], kmin=5)
+traj_lle = lle(table_glomeruli_young[,genes], m=2, k)$Y
+
+print("the points of the trajectory are plotted")
+
+traj_graph = conn_knn_graph(traj_lle,5)
+ends = find_extreme_cells(traj_graph, traj_lle)
+start = 1
+
+print("The trajectory connections were plotted")
+
+distances = graph_process_distance(traj_graph,embedding = traj_lle,start = 1)
+
+traj_lle_for_graph = as.data.frame(traj_lle)
+colnames(traj_lle_for_graph) = c("Manifold_dim_1","Manifold_dim_2")
+traj_lle_for_graph$Manifold_dim_1 = as.numeric(traj_lle_for_graph$Manifold_dim_1)
+traj_lle_for_graph$Manifold_dim_2 = as.numeric(traj_lle_for_graph$Manifold_dim_2)
+traj_lle_for_graph<- cbind(ROI= rownames(table_glomeruli_young), disease_gen= t(romics_glomeruli_young_imp$metadata[10,]), traj_lle_for_graph, branches =  assign_branches(traj_graph,start = 1))
+
+print("The plots is colored by condition")
+
+traj_lle_for_graph<-cbind(traj_lle_for_graph,data.frame(disease_age_structure=t(romics_glomeruli_young_imp$metadata[14,])))
+
+ggplot(traj_lle_for_graph,aes(x=Manifold_dim_1,Manifold_dim_2,color=structure_disease_age))+ geom_point(size=1,)+ geom_text(label=traj_lle_for_graph$ROI)+theme_ROP()
+
+DT::datatable(traj_lle_for_graph)
+```
+
+## data export
+The glomeruli young data and statistics were exported
+```{r data_export_glomeruli_young}
+results_glomeruli_young<-romicsExportData(romics_glomeruli_young,statistics = T,missing_data = T,IDs = T)
+write.csv(results_glomeruli_young,file = "03_output_files/11_results_glomeruli_young_non_imputed.csv")
+```
+
+# Adult glomeruli
+we will generate a subset comprising only the glomeruli for all adult glomeruli were also created for AS, FSGS, and MN compared to controls.
+```{r Subsetting_glomeruli_adult}
+romics_glomeruli_adult<-romicsSubset(romics_geomx, subset_vector =c("Glomeruli_Alport_Adult","Glomeruli_FSGS_Adult","Glomeruli_MN_Adult","Glomeruli_Normal_Adult") ,type = "keep", factor = "structure_disease_age",by = "level")
+
+romics_glomeruli_adult_AS<-romicsSubset(romics_glomeruli_adult, subset_vector =c("Glomeruli_Alport_Adult","Glomeruli_Normal_Adult") ,type = "keep", factor = "structure_disease_age",by = "level")
+
+romics_glomeruli_FSGS_Adult<-romicsSubset(romics_glomeruli_adult, subset_vector =c("Glomeruli_FSGS_Adult","Glomeruli_Normal_Adult") ,type = "keep", factor = "structure_disease_age",by = "level")
+
+romics_glomeruli_MN_Adult<-romicsSubset(romics_glomeruli_adult, subset_vector =c("Glomeruli_MN_Adult","Glomeruli_Normal_Adult") ,type = "keep", factor = "structure_disease_age",by = "level")
+
+```
+
+The data was filtered to contain at least 50% of values for a given group
+```{r missingness_filtering_glomeruli_adult}
+romics_glomeruli_adult<-romicsFilterMissing(romics_glomeruli_adult,percentage_completeness = 50)
+```
+
+The sample grouping was checked by h-clustering
+```{r Hclust_glomeruli_adult}
+romicsHclust(romics_glomeruli_adult)
+```
+
+and then by PCA
+```{r PCA_glomeruli_adult}
+#to perform the PCA, missing value need to be imputed
+imputeMissingEval(romics_glomeruli_adult,nb_stdev = 2,width_stdev = 0.5)
+romics_glomeruli_adult_imp<-imputeMissing(romics_glomeruli_adult,nb_stdev = 2,width_stdev = 0.5)
+
+romics_glomeruli_adult_AS_imp<-romicsSubset(romics_glomeruli_adult_imp, subset_vector =c("Glomeruli_Alport_Adult","Glomeruli_Normal_Adult") ,type = "keep", factor = "structure_disease_age",by = "level")
+
+romics_glomeruli_FSGS_Adult_imp<-romicsSubset(romics_glomeruli_adult_imp, subset_vector =c("Glomeruli_FSGS_Adult","Glomeruli_Normal_Adult") ,type = "keep", factor = "structure_disease_age",by = "level")
+
+romics_glomeruli_MN_Adult_imp<-romicsSubset(romics_glomeruli_adult_imp, subset_vector =c("Glomeruli_MN_Adult","Glomeruli_Normal_Adult") ,type = "keep", factor = "structure_disease_age",by = "level")
+
+
+indPCAplot(romics_glomeruli_adult_imp,label = F,Xcomp = 1,Ycomp = 2,plotType = "individual")
+indPCAplot(romics_glomeruli_adult_imp,label = F,Xcomp = 1,Ycomp = 3,plotType = "individual")
+indPCA3D(romics_glomeruli_adult_imp)
+
+indPCA3D(romics_glomeruli_adult_imp, Xcomp = 1,Ycomp = 2,Zcomp = 3)
+
+PCA_glomeruli_adult<-romicsPCA(romicsChangeIDs(romics_glomeruli_adult_imp,newIDs = "Uniprot_accession"))
+
+PCA_contrib<-as.data.frame(PCA_glomeruli_adult$var$contrib)
+write.csv(PCA_contrib,file="03_output_files/12_PCA_contributions_all_glomeruli_adult.csv")
+
+universe <- rownames(PCA_contrib)
+
+print("For the PC1 and PC2 the top 10% transcript contributing to the separation were extracted")
+
+PC1_10percent <- PCA_contrib[order(PCA_contrib[,1],decreasing = T),]
+PC1_10percent <- rownames(PC1_10percent)[1:ceiling(nrow(PC1_10percent)/10)]
+
+PC2_10percent <- PCA_contrib[order(PCA_contrib[,2],decreasing = T),]
+PC2_10percent <- rownames(PC2_10percent)[1:ceiling(nrow(PC2_10percent)/10)]
+
+PC3_10percent <- PCA_contrib[order(PCA_contrib[,3],decreasing = T),]
+PC3_10percent <- rownames(PC3_10percent)[1:ceiling(nrow(PC3_10percent)/10)]
+
+print("Enrichment analysis were then performed")
+
+PC1_10percent_enr<-cbind(component = "PC1", Enrich_EASE(PC1_10percent,universe))
+PC2_10percent_enr<-cbind(component = "PC2", Enrich_EASE(PC2_10percent,universe))
+PC3_10percent_enr<-cbind(component = "PC3", Enrich_EASE(PC3_10percent,universe))
+
+  
+PCA_glomeruli_adult_enr<- enrfilter(rbind(PC1_10percent_enr, PC2_10percent_enr, PC3_10percent_enr),pval_type = "pval",foldchange = 1,min_feature = 2)
+
+DT::datatable(PCA_glomeruli_adult_enr)
+
+write.table(PCA_glomeruli_adult_enr, file="./03_output_files/13_PCA_enrichment_all_glomeruli_adult.txt",sep = "\t",row.names = F)
+```
+
+General statistics were performed
+```{r general_statistics_glomeruli_adult}
+romics_glomeruli_adult<-romicsMean(romics_glomeruli_adult)
+romics_glomeruli_adult<-romicsSd(romics_glomeruli_adult)
+romics_glomeruli_adult<-romicsZscores(romics_glomeruli_adult)
+romics_glomeruli_adult<-romicsANOVA(romics_glomeruli_adult)
+romics_glomeruli_adult<-romicsGlmBinomial(romics_glomeruli_adult)
+romics_glomeruli_adult<-romicsTtest(romics_glomeruli_adult,var.equal = F,percentage_completeness = 50)
+romics_glomeruli_adult<-romicsTtest(romics_glomeruli_adult,var.equal = F,percentage_completeness = 50,reverse_order = T)
+```
+
+The volcano plots were displayed
+```{r volcanoes_glomeruli_adult}
+romicsVolcano(romics_glomeruli_adult,p_type = "padj",min_fold_change = 0,p = 0.05, plot_type = "ggplot")
+```
+
+enrichment analysis was performed to compare diseases and normal in the adult group
+```{r enrichment_glomeruli_adult}
+# alport syndrome
+romics_glomeruli_adult_Uniprot<-romicsChangeIDs(romics_glomeruli_adult,newIDs = "Uniprot_accession")
+
+universe<-rownames(romics_glomeruli_adult_Uniprot$statistics)
+
+up_AS_adult<-rownames(romics_glomeruli_adult_Uniprot$statistics)[(
+  romics_glomeruli_adult_Uniprot$statistics$Glomeruli_Normal_Adult_vs_Glomeruli_Alport_Adult_glmBionomialTest_padj<0.05&
+    romics_glomeruli_adult_Uniprot$statistics$Glomeruli_Normal_Adult_vs_Glomeruli_Alport_Adult_directionality==-1)|
+    (!is.na(romics_glomeruli_adult_Uniprot$statistics$Glomeruli_Alport_Adult_vs_Glomeruli_Normal_Adult_Ttest_padj)& romics_glomeruli_adult_Uniprot$statistics$Glomeruli_Alport_Adult_vs_Glomeruli_Normal_Adult_Ttest_padj<0.05&
+       romics_glomeruli_adult_Uniprot$statistics$`log(Glomeruli_Alport_Adult/Glomeruli_Normal_Adult)`>0)]
+
+down_AS_adult<-rownames(romics_glomeruli_adult_Uniprot$statistics)[(
+  romics_glomeruli_adult_Uniprot$statistics$Glomeruli_Normal_Adult_vs_Glomeruli_Alport_Adult_glmBionomialTest_padj<0.05&
+    romics_glomeruli_adult_Uniprot$statistics$Glomeruli_Normal_Adult_vs_Glomeruli_Alport_Adult_directionality==1)|
+    (!is.na(romics_glomeruli_adult_Uniprot$statistics$Glomeruli_Alport_Adult_vs_Glomeruli_Normal_Adult_Ttest_padj)& romics_glomeruli_adult_Uniprot$statistics$Glomeruli_Alport_Adult_vs_Glomeruli_Normal_Adult_Ttest_padj<0.05&
+       romics_glomeruli_adult_Uniprot$statistics$`log(Glomeruli_Alport_Adult/Glomeruli_Normal_Adult)`<0)]
+
+#we will now eliminate the gene present in both lists (ambigous calls)
+up<-up_AS_adult[!up_AS_adult %in% down_AS_adult]
+down<-down_AS_adult[!down_AS_adult %in% up_AS_adult]
+
+up_AS_adult<-cbind(enriched_in= "up_in_AS_adult",Enrich_EASE(up,universe))
+down_AS_adult<-cbind(enriched_in= "down_in_AS_adult",Enrich_EASE(down,universe))
+
+enrichment_AS_adult<-enrfilter(rbind(up_AS_adult,down_AS_adult),pval_type = "pval", pval = 0.05,foldchange = 1,min_feature = 2)
+
+write.table(enrichment_AS_adult,file = "03_output_files/14_enrichment_AS_adult.txt",sep = "\t",row.names = F)
+
+# FSGS 
+up_FSGS_adult<-rownames(romics_glomeruli_adult_Uniprot$statistics)[(
+  romics_glomeruli_adult_Uniprot$statistics$Glomeruli_Normal_Adult_vs_Glomeruli_FSGS_Adult_glmBionomialTest_padj<0.05&
+    romics_glomeruli_adult_Uniprot$statistics$Glomeruli_Normal_Adult_vs_Glomeruli_FSGS_Adult_directionality==-1)|
+    (!is.na(romics_glomeruli_adult_Uniprot$statistics$Glomeruli_FSGS_Adult_vs_Glomeruli_Normal_Adult_Ttest_padj)& romics_glomeruli_adult_Uniprot$statistics$Glomeruli_FSGS_Adult_vs_Glomeruli_Normal_Adult_Ttest_padj<0.05&
+       romics_glomeruli_adult_Uniprot$statistics$`log(Glomeruli_FSGS_Adult/Glomeruli_Normal_Adult)`>0)]
+
+down_FSGS_adult<-rownames(romics_glomeruli_adult_Uniprot$statistics)[(
+  romics_glomeruli_adult_Uniprot$statistics$Glomeruli_Normal_Adult_vs_Glomeruli_FSGS_Adult_glmBionomialTest_padj<0.05&
+    romics_glomeruli_adult_Uniprot$statistics$Glomeruli_Normal_Adult_vs_Glomeruli_FSGS_Adult_directionality==1)|
+    (!is.na(romics_glomeruli_adult_Uniprot$statistics$Glomeruli_FSGS_Adult_vs_Glomeruli_Normal_Adult_Ttest_padj)& romics_glomeruli_adult_Uniprot$statistics$Glomeruli_FSGS_Adult_vs_Glomeruli_Normal_Adult_Ttest_padj<0.05&
+       romics_glomeruli_adult_Uniprot$statistics$`log(Glomeruli_FSGS_Adult/Glomeruli_Normal_Adult)`<0)]
+
+#we will now eliminate the gene present in both lists (ambigous calls)
+up<-up_FSGS_adult[!up_FSGS_adult %in% down_FSGS_adult]
+down<-down_FSGS_adult[!down_FSGS_adult %in% up_FSGS_adult]
+
+up_FSGS_adult<-cbind(enriched_in= "up_in_FSGS_adult",Enrich_EASE(up,universe))
+down_FSGS_adult<-cbind(enriched_in= "down_in_FSGS_adult",Enrich_EASE(down,universe))
+
+enrichment_FSGS_adult<-enrfilter(rbind(up_FSGS_adult,down_FSGS_adult),pval_type = "pval", pval = 0.05,foldchange = 1,min_feature = 2)
+
+write.table(enrichment_FSGS_adult,file = "03_output_files/15_enrichment_FSGS_adult.txt",sep = "\t",row.names = F)
+
+# MN
+up_MN_adult<-rownames(romics_glomeruli_adult_Uniprot$statistics)[(
+  romics_glomeruli_adult_Uniprot$statistics$Glomeruli_Normal_Adult_vs_Glomeruli_MN_Adult_glmBionomialTest_padj<0.05&
+    romics_glomeruli_adult_Uniprot$statistics$Glomeruli_Normal_Adult_vs_Glomeruli_MN_Adult_directionality==-1)|
+    (!is.na(romics_glomeruli_adult_Uniprot$statistics$Glomeruli_MN_Adult_vs_Glomeruli_Normal_Adult_Ttest_padj)& romics_glomeruli_adult_Uniprot$statistics$Glomeruli_MN_Adult_vs_Glomeruli_Normal_Adult_Ttest_padj<0.05&
+       romics_glomeruli_adult_Uniprot$statistics$`log(Glomeruli_MN_Adult/Glomeruli_Normal_Adult)`>0)]
+
+down_MN_adult<-rownames(romics_glomeruli_adult_Uniprot$statistics)[(
+  romics_glomeruli_adult_Uniprot$statistics$Glomeruli_Normal_Adult_vs_Glomeruli_MN_Adult_glmBionomialTest_padj<0.05&
+    romics_glomeruli_adult_Uniprot$statistics$Glomeruli_Normal_Adult_vs_Glomeruli_MN_Adult_directionality==1)|
+    (!is.na(romics_glomeruli_adult_Uniprot$statistics$Glomeruli_MN_Adult_vs_Glomeruli_Normal_Adult_Ttest_padj)& romics_glomeruli_adult_Uniprot$statistics$Glomeruli_MN_Adult_vs_Glomeruli_Normal_Adult_Ttest_padj<0.05&
+       romics_glomeruli_adult_Uniprot$statistics$`log(Glomeruli_MN_Adult/Glomeruli_Normal_Adult)`<0)]
+
+#we will now eliminate the gene present in both lists (ambigous calls)
+up<-up_MN_adult[!up_MN_adult %in% down_MN_adult]
+down<-down_MN_adult[!down_MN_adult %in% up_MN_adult]
+
+up_MN_adult<-cbind(enriched_in= "up_in_MN_adult",Enrich_EASE(up,universe))
+down_MN_adult<-cbind(enriched_in= "down_in_MN_adult",Enrich_EASE(down,universe))
+
+enrichment_MN_adult<-enrfilter(rbind(up_MN_adult,down_MN_adult),pval_type = "pval", pval = 0.05,foldchange = 1,min_feature = 2)
+
+write.table(enrichment_MN_adult,file = "03_output_files/16_enrichment_MN_adult.txt",sep = "\t",row.names = F)
+```
+
+For this subset we performed a trajectory analysis using the package SLICER
+```{r Trajectory_glomeruli_adult}
+table_glomeruli_adult<-t(romicsSampleNameFromFactor(romics_glomeruli_adult_imp,factor = "disease_gen_ROI")$data)
+genes <- select_genes(table_glomeruli_adult)
+k = select_k(table_glomeruli_adult[,genes], kmin=5)
+traj_lle = lle(table_glomeruli_adult[,genes], m=2, k)$Y
+
+print("the points of the trajectory are plotted")
+
+traj_graph = conn_knn_graph(traj_lle,5)
+ends = find_extreme_cells(traj_graph, traj_lle)
+start = 1
+
+print("The trajectory connections were plotted")
+
+distances = graph_process_distance(traj_graph,embedding = traj_lle,start = 1)
+
+traj_lle_for_graph = as.data.frame(traj_lle)
+colnames(traj_lle_for_graph) = c("Manifold_dim_1","Manifold_dim_2")
+traj_lle_for_graph$Manifold_dim_1 = as.numeric(traj_lle_for_graph$Manifold_dim_1)
+traj_lle_for_graph$Manifold_dim_2 = as.numeric(traj_lle_for_graph$Manifold_dim_2)
+traj_lle_for_graph<- cbind(ROI= rownames(table_glomeruli_adult), disease_gen= t(romics_glomeruli_adult_imp$metadata[10,]), traj_lle_for_graph, branches =  assign_branches(traj_graph,start = 1))
+
+print("The plots is colored by condition")
+
+traj_lle_for_graph<-cbind(traj_lle_for_graph,data.frame(disease_age_structure=t(romics_glomeruli_adult_imp$metadata[14,])))
+
+ggplot(traj_lle_for_graph,aes(x=Manifold_dim_1,Manifold_dim_2,color=structure_disease_age))+ geom_point(size=1,)+ geom_text(label=traj_lle_for_graph$ROI)+theme_ROP()
+
+DT::datatable(traj_lle_for_graph)
+```
+
+## data export
+the adult glomeruli data was exported
+```{r data_export_glomeruli_adult}
+results_glomeruli_adult<-romicsExportData(romics_glomeruli_adult,statistics = T,missing_data = T,IDs = T)
+write.csv(results_glomeruli_adult,file = "03_output_files/17_results_glomeruli_adult_non_imputed.csv")
+```
+
+# Alport syndrome adult
+The data of the adult and control AS only will be evaluated
+The data was filtered to contain at least 50% of values for a given group
+```{r missingness_filtering_glomeruli_adult_AS}
+romics_glomeruli_adult_AS<-romicsFilterMissing(romics_glomeruli_adult_AS,percentage_completeness = 50)
+```
+
+The sample grouping was checked by h-clustering
+```{r Hclust_glomeruli_adult_AS}
+romicsHclust(romics_glomeruli_adult_AS)
+```
+
+and then by PCA
+```{r PCA_glomeruli_adult_AS}
+#to perform the PCA, missing value need to be imputed
+imputeMissingEval(romics_glomeruli_adult_AS,nb_stdev = 2,width_stdev = 0.5)
+romics_glomeruli_adult_AS_imp<-imputeMissing(romics_glomeruli_adult_AS,nb_stdev = 2,width_stdev = 0.5)
+
+indPCAplot(romics_glomeruli_adult_AS_imp,label = F,Xcomp = 1,Ycomp = 2,plotType = "individual")
+indPCAplot(romics_glomeruli_adult_AS_imp,label = F,Xcomp = 1,Ycomp = 3,plotType = "individual")
+
+indPCA3D(romics_glomeruli_adult_AS_imp, Xcomp = 1,Ycomp = 2,Zcomp = 3)
+
+PCA_glomeruli_adult_AS<-romicsPCA(romicsChangeIDs(romics_glomeruli_adult_AS_imp,newIDs = "Uniprot_accession"))
+
+PCA_contrib<-as.data.frame(PCA_glomeruli_adult_AS$var$contrib)
+write.csv(PCA_contrib,file="03_output_files/18_PCA_contributions_all_glomeruli_adult_AS.csv")
+
+universe <- rownames(PCA_contrib)
+
+print("For the PC1 and PC2 the top 10% transcript contributing to the separation were extracted")
+
+PC1_10percent <- PCA_contrib[order(PCA_contrib[,1],decreasing = T),]
+PC1_10percent <- rownames(PC1_10percent)[1:ceiling(nrow(PC1_10percent)/10)]
+
+PC2_10percent <- PCA_contrib[order(PCA_contrib[,2],decreasing = T),]
+PC2_10percent <- rownames(PC2_10percent)[1:ceiling(nrow(PC2_10percent)/10)]
+
+PC3_10percent <- PCA_contrib[order(PCA_contrib[,3],decreasing = T),]
+PC3_10percent <- rownames(PC3_10percent)[1:ceiling(nrow(PC3_10percent)/10)]
+
+print("Enrichment analysis were then performed")
+
+PC1_10percent_enr<-cbind(component = "PC1", Enrich_EASE(PC1_10percent,universe))
+PC2_10percent_enr<-cbind(component = "PC2", Enrich_EASE(PC2_10percent,universe))
+PC3_10percent_enr<-cbind(component = "PC3", Enrich_EASE(PC3_10percent,universe))
+
+  
+PCA_glomeruli_adult_AS_enr<- enrfilter(rbind(PC1_10percent_enr, PC2_10percent_enr, PC3_10percent_enr),pval_type = "pval",foldchange = 1,min_feature = 2)
+
+DT::datatable(PCA_glomeruli_adult_AS_enr)
+
+write.table(PCA_glomeruli_adult_AS_enr, file="./03_output_files/19_PCA_enrichment_all_glomeruli_adult_AS.txt",sep = "\t",row.names = F)
+```
+
+General statistics were performed
+```{r general_statistics_glomeruli_adult_AS}
+romics_glomeruli_adult_AS<-romicsMean(romics_glomeruli_adult_AS)
+romics_glomeruli_adult_AS<-romicsSd(romics_glomeruli_adult_AS)
+romics_glomeruli_adult_AS<-romicsZscores(romics_glomeruli_adult_AS)
+romics_glomeruli_adult_AS<-romicsANOVA(romics_glomeruli_adult_AS)
+romics_glomeruli_adult_AS<-romicsGlmBinomial(romics_glomeruli_adult_AS)
+romics_glomeruli_adult_AS<-romicsTtest(romics_glomeruli_adult_AS,var.equal = F,percentage_completeness = 50)
+romics_glomeruli_adult_AS<-romicsTtest(romics_glomeruli_adult_AS,var.equal = F,percentage_completeness = 50,reverse_order = T)
+```
+
+The volcano plots were displayed
+```{r volcanoes_glomeruli_adult_AS}
+romicsVolcano(romics_glomeruli_adult_AS,p_type = "padj",min_fold_change = 0,p = 0.05, plot_type = "ggplot")
+```
+
+For this subset we performed a trajectory analysis using the package SLICER
+```{r Trajectory_glomeruli_adult_AS}
+table_glomeruli_adult_AS<-t(romicsSampleNameFromFactor(romics_glomeruli_adult_AS_imp,factor = "disease_gen_ROI")$data)
+genes <- select_genes(table_glomeruli_adult_AS)
+k = select_k(table_glomeruli_adult_AS[,genes], kmin=5)
+traj_lle = lle(table_glomeruli_adult_AS[,genes], m=2, k)$Y
+
+print("the points of the trajectory are plotted")
+
+traj_graph = conn_knn_graph(traj_lle,5)
+ends = find_extreme_cells(traj_graph, traj_lle)
+start = 1
+
+print("The trajectory connections were plotted")
+
+distances = graph_process_distance(traj_graph,embedding = traj_lle,start = 1)
+
+traj_lle_for_graph = as.data.frame(traj_lle)
+colnames(traj_lle_for_graph) = c("Manifold_dim_1","Manifold_dim_2")
+traj_lle_for_graph$Manifold_dim_1 = as.numeric(traj_lle_for_graph$Manifold_dim_1)
+traj_lle_for_graph$Manifold_dim_2 = as.numeric(traj_lle_for_graph$Manifold_dim_2)
+traj_lle_for_graph<- cbind(ROI= rownames(table_glomeruli_adult_AS), disease_gen= t(romics_glomeruli_adult_AS_imp$metadata[10,]), traj_lle_for_graph, branches =  assign_branches(traj_graph,start = 1))
+
+print("The plots is colored by condition")
+
+traj_lle_for_graph<-cbind(traj_lle_for_graph,data.frame(disease_age_structure=t(romics_glomeruli_adult_AS_imp$metadata[14,])))
+
+ggplot(traj_lle_for_graph,aes(x=Manifold_dim_1,Manifold_dim_2,color=structure_disease_age))+ geom_point(size=1,)+ geom_text(label=traj_lle_for_graph$ROI)+theme_ROP()
+
+DT::datatable(traj_lle_for_graph)
+```
+
+## data export
+The Adult AS data was exported
+```{r data_export_glomeruli_adult_AS}
+results_glomeruli_adult_AS<-romicsExportData(romics_glomeruli_adult_AS,statistics = T,missing_data = T,IDs = T)
+write.csv(results_glomeruli_adult_AS,file = "03_output_files/20_results_glomeruli_adult_AS_non_imputed.csv")
+```
+
+# FSGS adult
+The data of the adult and control FSGS only will be evaluated
+The data was filtered to contain at least 50% of values for a given group
+```{r missingness_filtering_glomeruli_FSGS_Adult}
+romics_glomeruli_FSGS_Adult<-romicsFilterMissing(romics_glomeruli_FSGS_Adult,percentage_completeness = 50)
+```
+
+The sample grouping was checked by h-clustering
+```{r Hclust_glomeruli_FSGS_Adult}
+romicsHclust(romics_glomeruli_FSGS_Adult)
+```
+
+and then by PCA
+```{r PCA_glomeruli_FSGS_Adult}
+#to perform the PCA, missing value need to be imputed
+imputeMissingEval(romics_glomeruli_FSGS_Adult,nb_stdev = 2,width_stdev = 0.5)
+romics_glomeruli_FSGS_Adult_imp<-imputeMissing(romics_glomeruli_FSGS_Adult,nb_stdev = 2,width_stdev = 0.5)
+
+indPCAplot(romics_glomeruli_FSGS_Adult_imp,label = F,Xcomp = 1,Ycomp = 2,plotType = "individual")
+indPCAplot(romics_glomeruli_FSGS_Adult_imp,label = F,Xcomp = 1,Ycomp = 3,plotType = "individual")
+
+indPCA3D(romics_glomeruli_FSGS_Adult_imp, Xcomp = 1,Ycomp = 2,Zcomp = 3)
+
+PCA_glomeruli_FSGS_Adult<-romicsPCA(romicsChangeIDs(romics_glomeruli_FSGS_Adult_imp,newIDs = "Uniprot_accession"))
+
+PCA_contrib<-as.data.frame(PCA_glomeruli_FSGS_Adult$var$contrib)
+write.csv(PCA_contrib,file="03_output_files/21_PCA_contributions_all_glomeruli_FSGS_Adult.csv")
+
+universe <- rownames(PCA_contrib)
+
+print("For the PC1 and PC2 the top 10% transcript contributing to the separation were extracted")
+
+PC1_10percent <- PCA_contrib[order(PCA_contrib[,1],decreasing = T),]
+PC1_10percent <- rownames(PC1_10percent)[1:ceiling(nrow(PC1_10percent)/10)]
+
+PC2_10percent <- PCA_contrib[order(PCA_contrib[,2],decreasing = T),]
+PC2_10percent <- rownames(PC2_10percent)[1:ceiling(nrow(PC2_10percent)/10)]
+
+PC3_10percent <- PCA_contrib[order(PCA_contrib[,3],decreasing = T),]
+PC3_10percent <- rownames(PC3_10percent)[1:ceiling(nrow(PC3_10percent)/10)]
+
+print("Enrichment analysis were then performed")
+
+PC1_10percent_enr<-cbind(component="PC1",Enrich_EASE(PC1_10percent,universe))
+PC2_10percent_enr<-cbind(component="PC2",Enrich_EASE(PC2_10percent,universe))
+PC3_10percent_enr<-cbind(component="PC3",Enrich_EASE(PC3_10percent,universe))
+
+  
+PCA_glomeruli_FSGS_Adult_enr<- enrfilter(rbind(PC1_10percent_enr, PC2_10percent_enr, PC3_10percent_enr),pval_type = "pval",foldchange = 1,min_feature = 2)
+
+DT::datatable(PCA_glomeruli_FSGS_Adult_enr)
+
+write.table(PCA_glomeruli_FSGS_Adult_enr, file="./03_output_files/22_PCA_enrichment_all_glomeruli_FSGS_Adult.txt",sep = "\t",row.names = F)
+```
+
+General statistics were performed
+```{r general_statistics_glomeruli_FSGS_Adult}
+romics_glomeruli_FSGS_Adult<-romicsMean(romics_glomeruli_FSGS_Adult)
+romics_glomeruli_FSGS_Adult<-romicsSd(romics_glomeruli_FSGS_Adult)
+romics_glomeruli_FSGS_Adult<-romicsZscores(romics_glomeruli_FSGS_Adult)
+romics_glomeruli_FSGS_Adult<-romicsANOVA(romics_glomeruli_FSGS_Adult)
+romics_glomeruli_FSGS_Adult<-romicsGlmBinomial(romics_glomeruli_FSGS_Adult)
+romics_glomeruli_FSGS_Adult<-romicsTtest(romics_glomeruli_FSGS_Adult,var.equal = F,percentage_completeness = 50)
+romics_glomeruli_FSGS_Adult<-romicsTtest(romics_glomeruli_FSGS_Adult,var.equal = F,percentage_completeness = 50,reverse_order = T)
+```
+
+The volcano plots were displayed
+```{r volcanoes_glomeruli_FSGS_Adult}
+romicsVolcano(romics_glomeruli_FSGS_Adult,p_type = "padj",min_fold_change = 0,p = 0.05, plot_type = "ggplot")
+```
+
+For this subset we performed a trajectory analysis using the package SLICER
+```{r Trajectory_glomeruli_FSGS_Adult}
+table_glomeruli_FSGS_Adult<-t(romicsSampleNameFromFactor(romics_glomeruli_FSGS_Adult_imp,factor = "disease_gen_ROI")$data)
+genes <- select_genes(table_glomeruli_FSGS_Adult)
+k = select_k(table_glomeruli_FSGS_Adult[,genes], kmin=5)
+traj_lle = lle(table_glomeruli_FSGS_Adult[,genes], m=2, k)$Y
+
+print("the points of the trajectory are plotted")
+
+traj_graph = conn_knn_graph(traj_lle,5)
+ends = find_extreme_cells(traj_graph, traj_lle)
+start = 1
+
+print("The trajectory connections were plotted")
+
+distances = graph_process_distance(traj_graph,embedding = traj_lle,start = 1)
+
+traj_lle_for_graph = as.data.frame(traj_lle)
+colnames(traj_lle_for_graph) = c("Manifold_dim_1","Manifold_dim_2")
+traj_lle_for_graph$Manifold_dim_1 = as.numeric(traj_lle_for_graph$Manifold_dim_1)
+traj_lle_for_graph$Manifold_dim_2 = as.numeric(traj_lle_for_graph$Manifold_dim_2)
+traj_lle_for_graph<- cbind(ROI= rownames(table_glomeruli_FSGS_Adult), disease_gen= t(romics_glomeruli_FSGS_Adult_imp$metadata[10,]), traj_lle_for_graph, branches =  assign_branches(traj_graph,start = 1))
+
+print("The plots is colored by condition")
+
+traj_lle_for_graph<-cbind(traj_lle_for_graph,data.frame(disease_age_structure=t(romics_glomeruli_FSGS_Adult_imp$metadata[14,])))
+
+ggplot(traj_lle_for_graph,aes(x=Manifold_dim_1,Manifold_dim_2,color=structure_disease_age))+ geom_point(size=1,)+ geom_text(label=traj_lle_for_graph$ROI)+theme_ROP()
+
+DT::datatable(traj_lle_for_graph)
+```
+
+## data export
+MN adult data was exported
+```{r data_export_glomeruli_FSGS_Adult}
+results_glomeruli_FSGS_Adult<-romicsExportData(romics_glomeruli_FSGS_Adult,statistics = T,missing_data = T,IDs = T)
+write.csv(results_glomeruli_FSGS_Adult,file = "03_output_files/23_results_glomeruli_FSGS_Adult_non_imputed.csv")
+```
+
+# MN adult
+The data of the adult and control MN only will be evaluated
+The data was filtered to contain at least 50% of values for a given group
+```{r missingness_filtering_glomeruli_MN_Adult}
+romics_glomeruli_MN_Adult<-romicsFilterMissing(romics_glomeruli_MN_Adult,percentage_completeness = 50)
+```
+
+The sample grouping was checked by h-clustering
+```{r Hclust_glomeruli_MN_Adult}
+romicsHclust(romics_glomeruli_MN_Adult)
+```
+
+and then by PCA
+```{r PCA_glomeruli_MN_Adult}
+indPCAplot(romics_glomeruli_MN_Adult_imp,label = F,Xcomp = 1,Ycomp = 2,plotType = "individual")
+indPCAplot(romics_glomeruli_MN_Adult_imp,label = F,Xcomp = 1,Ycomp = 3,plotType = "individual")
+
+indPCA3D(romics_glomeruli_MN_Adult_imp, Xcomp = 1,Ycomp = 2,Zcomp = 3)
+
+PCA_glomeruli_MN_Adult<-romicsPCA(romicsChangeIDs(romics_glomeruli_MN_Adult_imp,newIDs = "Uniprot_accession"))
+
+PCA_contrib<-as.data.frame(PCA_glomeruli_MN_Adult$var$contrib)
+write.csv(PCA_contrib,file="03_output_files/24_PCA_contributions_all_glomeruli_MN_Adult.csv")
+
+universe <- rownames(PCA_contrib)
+
+print("For the PC1 and PC2 the top 10% transcript contributing to the separation were extracted")
+
+PC1_10percent <- PCA_contrib[order(PCA_contrib[,1],decreasing = T),]
+PC1_10percent <- rownames(PC1_10percent)[1:ceiling(nrow(PC1_10percent)/10)]
+
+PC2_10percent <- PCA_contrib[order(PCA_contrib[,2],decreasing = T),]
+PC2_10percent <- rownames(PC2_10percent)[1:ceiling(nrow(PC2_10percent)/10)]
+
+PC3_10percent <- PCA_contrib[order(PCA_contrib[,3],decreasing = T),]
+PC3_10percent <- rownames(PC3_10percent)[1:ceiling(nrow(PC3_10percent)/10)]
+
+print("Enrichment analysis were then performed")
+
+PC1_10percent_enr<-cbind(component="PC1",Enrich_EASE(PC1_10percent,universe))
+PC2_10percent_enr<-cbind(component="PC2",Enrich_EASE(PC2_10percent,universe))
+PC3_10percent_enr<-cbind(component="PC3",Enrich_EASE(PC3_10percent,universe))
+
+  
+PCA_glomeruli_MN_Adult_enr<- enrfilter(rbind(PC1_10percent_enr, PC2_10percent_enr, PC3_10percent_enr),pval_type = "pval",foldchange = 1,min_feature = 2)
+
+DT::datatable(PCA_glomeruli_MN_Adult_enr)
+
+write.table(PCA_glomeruli_MN_Adult_enr, file="./03_output_files/25_PCA_enrichment_all_glomeruli_MN_Adult.txt",sep = "\t",row.names = F)
+```
+
+General statistics were performed
+```{r general_statistics_glomeruli_MN_Adult}
+romics_glomeruli_MN_Adult<-romicsMean(romics_glomeruli_MN_Adult)
+romics_glomeruli_MN_Adult<-romicsSd(romics_glomeruli_MN_Adult)
+romics_glomeruli_MN_Adult<-romicsZscores(romics_glomeruli_MN_Adult)
+romics_glomeruli_MN_Adult<-romicsANOVA(romics_glomeruli_MN_Adult)
+romics_glomeruli_MN_Adult<-romicsGlmBinomial(romics_glomeruli_MN_Adult)
+romics_glomeruli_MN_Adult<-romicsTtest(romics_glomeruli_MN_Adult,var.equal = F,percentage_completeness = 50)
+romics_glomeruli_MN_Adult<-romicsTtest(romics_glomeruli_MN_Adult,var.equal = F,percentage_completeness = 50,reverse_order = T)
+```
+
+The volcano plots were displayed
+```{r volcanoes_glomeruli_MN_Adult}
+romicsVolcano(romics_glomeruli_MN_Adult,p_type = "padj",min_fold_change = 0,p = 0.05, plot_type = "ggplot")
+```
+
+For this subset we performed a trajectory analysis using the package SLICER
+```{r Trajectory_glomeruli_MN_Adult}
+table_glomeruli_MN_Adult<-t(romicsSampleNameFromFactor(romics_glomeruli_MN_Adult_imp,factor = "disease_gen_ROI")$data)
+genes <- select_genes(table_glomeruli_MN_Adult)
+k = select_k(table_glomeruli_MN_Adult[,genes], kmin=5)
+traj_lle = lle(table_glomeruli_MN_Adult[,genes], m=2, k)$Y
+
+print("the points of the trajectory are plotted")
+
+traj_graph = conn_knn_graph(traj_lle,5)
+ends = find_extreme_cells(traj_graph, traj_lle)
+start = 1
+
+print("The trajectory connections were plotted")
+
+distances = graph_process_distance(traj_graph,embedding = traj_lle,start = 1)
+
+traj_lle_for_graph = as.data.frame(traj_lle)
+colnames(traj_lle_for_graph) = c("Manifold_dim_1","Manifold_dim_2")
+traj_lle_for_graph$Manifold_dim_1 = as.numeric(traj_lle_for_graph$Manifold_dim_1)
+traj_lle_for_graph$Manifold_dim_2 = as.numeric(traj_lle_for_graph$Manifold_dim_2)
+traj_lle_for_graph<- cbind(ROI= rownames(table_glomeruli_MN_Adult), disease_gen= t(romics_glomeruli_MN_Adult_imp$metadata[10,]), traj_lle_for_graph, branches =  assign_branches(traj_graph,start = 1))
+
+print("The plots is colored by condition")
+
+traj_lle_for_graph<-cbind(traj_lle_for_graph,data.frame(disease_age_structure=t(romics_glomeruli_MN_Adult_imp$metadata[14,])))
+
+ggplot(traj_lle_for_graph,aes(x=Manifold_dim_1,Manifold_dim_2,color=structure_disease_age))+ geom_point(size=1,)+ geom_text(label=traj_lle_for_graph$ROI)+theme_ROP()
+
+
+DT::datatable(traj_lle_for_graph)
+```
+
+## data export
+the MN data was exported
+```{r data_export_glomeruli_MN_Adult}
+results_glomeruli_MN_Adult<-romicsExportData(romics_glomeruli_MN_Adult,statistics = T,missing_data = T,IDs = T)
+write.csv(results_glomeruli_MN_Adult,file = "03_output_files/26_results_glomeruli_MN_Adult_non_imputed.csv")
+```
+
+# Alport glomeruli
+The data of the adult and young AS only will be evaluated together
+we will generate a subset comprising only the glomeruli for all groups
+```{r Subsetting_glomeruli_alport}
+romics_glomeruli_alport<-romicsSubset(romics_geomx, subset_vector =c("Glomeruli_Alport_Young","Glomeruli_Alport_Adult") ,type = "keep", factor = "structure_disease_age",by = "level")
+```
+
+The data was filtered to contain at least 50% of values for a given group
+```{r missingness_filtering_glomeruli_alport}
+romics_glomeruli_alport<-romicsFilterMissing(romics_glomeruli_alport,percentage_completeness = 50)
+```
+
+The sample grouping was checked by h-clustering
+```{r Hclust_glomeruli_alport}
+romicsHclust(romics_glomeruli_alport)
+```
+
+and then by PCA
+```{r PCA_glomeruli_alport}
+#to perform the PCA, missing value need to be imputed
+imputeMissingEval(romics_glomeruli_alport,nb_stdev = 2,width_stdev = 0.5)
+romics_glomeruli_alport_imp<-imputeMissing(romics_glomeruli_alport,nb_stdev = 2,width_stdev = 0.5)
+
+indPCAplot(romics_glomeruli_alport_imp,label = F,Xcomp = 1,Ycomp = 2,plotType = "individual")
+indPCAplot(romics_glomeruli_alport_imp,label = F,Xcomp = 1,Ycomp = 3,plotType = "individual")
+
+indPCA3D(romics_glomeruli_alport_imp, Xcomp = 1,Ycomp = 2,Zcomp = 3)
+
+PCA_glomeruli_alport<-romicsPCA(romicsChangeIDs(romics_glomeruli_alport_imp,newIDs = "Uniprot_accession"))
+
+PCA_contrib<-as.data.frame(PCA_glomeruli_alport$var$contrib)
+write.csv(PCA_contrib,file="03_output_files/27_PCA_contributions_all_glomeruli_alport.csv")
+
+universe <- rownames(PCA_contrib)
+
+print("For the PC1 and PC2 the top 10% transcript contributing to the separation were extracted")
+
+PC1_10percent <- PCA_contrib[order(PCA_contrib[,1],decreasing = T),]
+PC1_10percent <- rownames(PC1_10percent)[1:ceiling(nrow(PC1_10percent)/10)]
+
+PC2_10percent <- PCA_contrib[order(PCA_contrib[,2],decreasing = T),]
+PC2_10percent <- rownames(PC2_10percent)[1:ceiling(nrow(PC2_10percent)/10)]
+
+PC3_10percent <- PCA_contrib[order(PCA_contrib[,3],decreasing = T),]
+PC3_10percent <- rownames(PC3_10percent)[1:ceiling(nrow(PC3_10percent)/10)]
+
+print("Enrichment analysis were then performed")
+
+PC1_10percent_enr<-cbind(component="PC1", Enrich_EASE(PC1_10percent,universe))
+PC2_10percent_enr<-cbind(component="PC2",Enrich_EASE(PC2_10percent,universe))
+PC3_10percent_enr<-cbind(component="PC3",Enrich_EASE(PC3_10percent,universe))
+
+  
+PCA_glomeruli_alport_enr<- enrfilter(rbind(PC1_10percent_enr, PC2_10percent_enr, PC3_10percent_enr),pval_type = "pval",foldchange = 1,min_feature = 2)
+
+DT::datatable(PCA_glomeruli_alport_enr)
+
+write.table(PCA_glomeruli_alport_enr, file="./03_output_files/28_PCA_enrichment_all_glomeruli_alport.txt",sep = "\t",row.names = F)
+```
+
+General statistics were performed
+```{r general_statistics_glomeruli_alport}
+romics_glomeruli_alport<-romicsMean(romics_glomeruli_alport)
+romics_glomeruli_alport<-romicsSd(romics_glomeruli_alport)
+romics_glomeruli_alport<-romicsZscores(romics_glomeruli_alport)
+romics_glomeruli_alport<-romicsANOVA(romics_glomeruli_alport)
+romics_glomeruli_alport<-romicsGlmBinomial(romics_glomeruli_alport)
+romics_glomeruli_alport<-romicsTtest(romics_glomeruli_alport,var.equal = F,percentage_completeness = 50)
+romics_glomeruli_alport<-romicsTtest(romics_glomeruli_alport,var.equal = F,percentage_completeness = 50,reverse_order = T)
+```
+
+The volcano plots were displayed
+```{r volcanoes_glomeruli_alport}
+romicsVolcano(romics_glomeruli_alport,p_type = "padj",min_fold_change = 0,p = 0.05,plot = 2, plot_type = "ggplot")
+```
+
+enrichment analysis was performed to compare alport and normal in the young group
+```{r enrichment_alport}
+romics_glomeruli_alport_Uniprot<-romicsChangeIDs(romics_glomeruli_alport,newIDs = "Uniprot_accession")
+
+universe<-rownames(romics_glomeruli_alport_Uniprot$statistics)
+
+up_AS_young<-rownames(romics_glomeruli_alport_Uniprot$statistics)[(
+  romics_glomeruli_alport_Uniprot$statistics$Glomeruli_Alport_Young_vs_Glomeruli_Alport_Adult_glmBionomialTest_padj<0.05&
+    romics_glomeruli_alport_Uniprot$statistics$Glomeruli_Alport_Young_vs_Glomeruli_Alport_Adult_directionality==1)|
+    (!is.na(romics_glomeruli_alport_Uniprot$statistics$Glomeruli_Alport_Young_vs_Glomeruli_Alport_Adult_Ttest_padj)& romics_glomeruli_alport_Uniprot$statistics$Glomeruli_Alport_Young_vs_Glomeruli_Alport_Adult_Ttest_padj<0.05&
+       romics_glomeruli_alport_Uniprot$statistics$`log(Glomeruli_Alport_Young/Glomeruli_Alport_Adult)`>0)]
+
+down_AS_young<-rownames(romics_glomeruli_alport_Uniprot$statistics)[(
+  romics_glomeruli_alport_Uniprot$statistics$Glomeruli_Alport_Young_vs_Glomeruli_Alport_Adult_glmBionomialTest_padj<0.05&
+    romics_glomeruli_alport_Uniprot$statistics$Glomeruli_Alport_Young_vs_Glomeruli_Alport_Adult_directionality==-1)|
+    (!is.na(romics_glomeruli_alport_Uniprot$statistics$Glomeruli_Alport_Young_vs_Glomeruli_Alport_Adult_Ttest_padj)& romics_glomeruli_alport_Uniprot$statistics$Glomeruli_Alport_Young_vs_Glomeruli_Alport_Adult_Ttest_padj<0.05&
+       romics_glomeruli_alport_Uniprot$statistics$`log(Glomeruli_Alport_Young/Glomeruli_Alport_Adult)`<0)]
+
+#we will now eliminate the gene present in both lists (ambigous calls)
+up<-up_AS_young[!up_AS_young %in% down_AS_young]
+down<-down_AS_young[!down_AS_young %in% up_AS_young]
+
+up_AS_young<-cbind(enriched_in= "up_AS_young",Enrich_EASE(up,universe))
+down_AS_young<-cbind(enriched_in= "down_in_AS_young",Enrich_EASE(down,universe))
+
+enrichment_AS_young<-enrfilter(rbind(up_AS_young,down_AS_young),pval_type = "pval", pval = 0.05,foldchange = 1,min_feature = 2)
+
+write.table(enrichment_AS_young,file = "03_output_files/29_enrichment_AS_young_vs_adult.txt",sep = "\t",row.names = F)
+
+```
+
+examples of genes with the highest pval (anova or ttest or glm binomial)
+```{r specific_transcripts_glomeruli_alport}
+Figs<-romics_glomeruli_alport
+singleVariablePlot(romics_glomeruli_alport,variable = "IL4I1",pval = "padj")
+singleVariablePlot(romics_glomeruli_alport,variable = "TXN2",pval = "padj")
+singleVariablePlot(romics_glomeruli_alport,variable = "MELTF",pval = "padj")
+singleVariablePlot(romics_glomeruli_alport,variable = "CCDC24",pval = "padj")
+singleVariablePlot(romics_glomeruli_alport,variable = "PRMT8",pval = "padj")
+singleVariablePlot(romics_glomeruli_alport,variable = "SFXN3",pval = "padj")
+singleVariablePlot(romics_glomeruli_alport,variable = "ZNF468",pval = "padj")
+singleVariablePlot(romics_glomeruli_alport,variable = "ZNF763",pval = "padj")
+singleVariablePlot(romics_glomeruli_alport,variable = "SARS1",pval = "padj")
+singleVariablePlot(romics_glomeruli_alport,variable = "ADAMTS13",pval = "padj")
+singleVariablePlot(romics_glomeruli_alport,variable = "HOXB8",pval = "padj")
+singleVariablePlot(romics_glomeruli_alport,variable = "MTRNR2L4",pval = "padj")
+singleVariablePlot(romics_glomeruli_alport,variable = "GCK",pval = "padj")
+singleVariablePlot(romics_glomeruli_alport,variable = "TMA7",pval = "padj")
+singleVariablePlot(romics_glomeruli_alport,variable = "SPARC",pval = "padj")
+singleVariablePlot(romics_glomeruli_alport,variable = "WNT8A",pval = "padj")
+singleVariablePlot(romics_glomeruli_alport,variable = "ITGA3",pval = "padj")
+```
+
+For this subset we performed a trajectory analysis using the package SLICER
+```{r Trajectory_glomeruli_alport_young}
+table_glomeruli_alport<-t(romicsSampleNameFromFactor(romics_glomeruli_alport_imp, factor = "disease_gen_ROI")$data)
+genes <- select_genes(table_glomeruli_alport)
+k = select_k(table_glomeruli_alport[,genes], kmin=5)
+traj_lle = lle(table_glomeruli_alport[,genes], m=2, k)$Y
+
+print("the points of the trajectory are plotted")
+
+traj_graph = conn_knn_graph(traj_lle,5)
+ends = find_extreme_cells(traj_graph, traj_lle)
+start = 1
+
+print("The trajectory connections were plotted")
+
+distances = graph_process_distance(traj_graph,embedding = traj_lle,start = 1)
+
+traj_lle_for_graph = as.data.frame(traj_lle)
+colnames(traj_lle_for_graph) = c("Manifold_dim_1","Manifold_dim_2")
+traj_lle_for_graph$Manifold_dim_1 = as.numeric(traj_lle_for_graph$Manifold_dim_1)
+traj_lle_for_graph$Manifold_dim_2 = as.numeric(traj_lle_for_graph$Manifold_dim_2)
+traj_lle_for_graph<- cbind(ROI= rownames(table_glomeruli_alport), disease_gen= t(romics_glomeruli_alport_imp$metadata[10,]), traj_lle_for_graph, branches =  assign_branches(traj_graph,start = 1))
+
+print("The plots is colored by condition")
+
+traj_lle_for_graph<-cbind(traj_lle_for_graph,data.frame(disease_age_structure=t(romics_glomeruli_alport_imp$metadata[14,])))
+
+ggplot(traj_lle_for_graph,aes(x=Manifold_dim_1,Manifold_dim_2,color=structure_disease_age))+ geom_point(size=1,)+ geom_text(label=traj_lle_for_graph$ROI)+theme_ROP()
+
+DT::datatable(traj_lle_for_graph)
+```
+
+## data export
+The alport adult and young data and statistics were exported
+```{r data_export_glomeruli_alport}
+results_glomeruli_alport<-romicsExportData(romics_glomeruli_alport,statistics = T,missing_data = T,IDs = T)
+write.csv(results_glomeruli_alport,file = "03_output_files/30_results_glomeruli_alport_non_imputed.csv")
+```
+
+# Venn Diagrams adult
+For each comparison we extracted the protein list up and down and saved them in csv files
+Then we generated lists of proteins corresponding to a venn diagram for the genes over and underexpressed in disease based on the ttest and glmBinomial tests.
+
+```{r Venn_adult}
+# alport syndrome
+universe<-rownames(romics_glomeruli_adult_Uniprot$statistics)
+
+up_AS_adult<-rownames(romics_glomeruli_adult_Uniprot$statistics)[(
+  romics_glomeruli_adult_Uniprot$statistics$Glomeruli_Normal_Adult_vs_Glomeruli_Alport_Adult_glmBionomialTest_padj<0.05&
+    romics_glomeruli_adult_Uniprot$statistics$Glomeruli_Normal_Adult_vs_Glomeruli_Alport_Adult_directionality==-1)|
+    (!is.na(romics_glomeruli_adult_Uniprot$statistics$Glomeruli_Alport_Adult_vs_Glomeruli_Normal_Adult_Ttest_padj)& romics_glomeruli_adult_Uniprot$statistics$Glomeruli_Alport_Adult_vs_Glomeruli_Normal_Adult_Ttest_padj<0.05&
+       romics_glomeruli_adult_Uniprot$statistics$`log(Glomeruli_Alport_Adult/Glomeruli_Normal_Adult)`>0)]
+
+down_AS_adult<-rownames(romics_glomeruli_adult_Uniprot$statistics)[(
+  romics_glomeruli_adult_Uniprot$statistics$Glomeruli_Normal_Adult_vs_Glomeruli_Alport_Adult_glmBionomialTest_padj<0.05&
+    romics_glomeruli_adult_Uniprot$statistics$Glomeruli_Normal_Adult_vs_Glomeruli_Alport_Adult_directionality==1)|
+    (!is.na(romics_glomeruli_adult_Uniprot$statistics$Glomeruli_Alport_Adult_vs_Glomeruli_Normal_Adult_Ttest_padj)& romics_glomeruli_adult_Uniprot$statistics$Glomeruli_Alport_Adult_vs_Glomeruli_Normal_Adult_Ttest_padj<0.05&
+       romics_glomeruli_adult_Uniprot$statistics$`log(Glomeruli_Alport_Adult/Glomeruli_Normal_Adult)`<0)]
+
+#we will now eliminate the gene present in both lists (ambiguous calls)
+up_AS<-up_AS_adult[!up_AS_adult %in% down_AS_adult]
+down_AS<-down_AS_adult[!down_AS_adult %in% up_AS_adult]
+
+# append the gene names
+up_AS_gene<-data.frame(UniprotID = up_AS)
+up_AS_gene<-merge(up_AS_gene,romics_glomeruli_adult_Uniprot$IDs[,c(2,1)],by.x=1,by.y=1,all = T)
+up_AS_gene<-up_AS_gene[up_AS_gene$UniprotID %in% up_AS,]
+
+down_AS_gene<-data.frame(UniprotID = down_AS)
+down_AS_gene<-merge(down_AS_gene,romics_glomeruli_adult_Uniprot$IDs[,c(2,1)],by.x=1,by.y=1,all = T)
+down_AS_gene<-down_AS_gene[down_AS_gene$UniprotID %in% down_AS,]
+
+write.table(up_AS_gene,file = "03_output_files/31_up_AS_Adult.txt",sep = "\t",row.names = F)
+write.table(down_AS_gene,file = "03_output_files/32_down_AS_Adult.txt",sep = "\t",row.names = F)
+
+# FSGS 
+up_FSGS_adult<-rownames(romics_glomeruli_adult_Uniprot$statistics)[(
+  romics_glomeruli_adult_Uniprot$statistics$Glomeruli_Normal_Adult_vs_Glomeruli_FSGS_Adult_glmBionomialTest_padj<0.05&
+    romics_glomeruli_adult_Uniprot$statistics$Glomeruli_Normal_Adult_vs_Glomeruli_FSGS_Adult_directionality==-1)|
+    (!is.na(romics_glomeruli_adult_Uniprot$statistics$Glomeruli_FSGS_Adult_vs_Glomeruli_Normal_Adult_Ttest_padj)& romics_glomeruli_adult_Uniprot$statistics$Glomeruli_FSGS_Adult_vs_Glomeruli_Normal_Adult_Ttest_padj<0.05&
+       romics_glomeruli_adult_Uniprot$statistics$`log(Glomeruli_FSGS_Adult/Glomeruli_Normal_Adult)`>0)]
+
+down_FSGS_adult<-rownames(romics_glomeruli_adult_Uniprot$statistics)[(
+  romics_glomeruli_adult_Uniprot$statistics$Glomeruli_Normal_Adult_vs_Glomeruli_FSGS_Adult_glmBionomialTest_padj<0.05&
+    romics_glomeruli_adult_Uniprot$statistics$Glomeruli_Normal_Adult_vs_Glomeruli_FSGS_Adult_directionality==1)|
+    (!is.na(romics_glomeruli_adult_Uniprot$statistics$Glomeruli_FSGS_Adult_vs_Glomeruli_Normal_Adult_Ttest_padj)& romics_glomeruli_adult_Uniprot$statistics$Glomeruli_FSGS_Adult_vs_Glomeruli_Normal_Adult_Ttest_padj<0.05&
+       romics_glomeruli_adult_Uniprot$statistics$`log(Glomeruli_FSGS_Adult/Glomeruli_Normal_Adult)`<0)]
+
+#we will now eliminate the gene present in both lists (ambigous calls)
+up_FSGS<-up_FSGS_adult[!up_FSGS_adult %in% down_FSGS_adult]
+down_FSGS<-down_FSGS_adult[!down_FSGS_adult %in% up_FSGS_adult]
+
+# append the gene names
+up_FSGS_gene<-data.frame(UniprotID = up_FSGS)
+up_FSGS_gene<-merge(up_FSGS_gene,romics_glomeruli_adult_Uniprot$IDs[,c(2,1)],by.x=1,by.y=1,all = T)
+up_FSGS_gene<-up_FSGS_gene[up_FSGS_gene$UniprotID %in% up_FSGS,]
+
+down_FSGS_gene<-data.frame(UniprotID = down_FSGS)
+down_FSGS_gene<-merge(down_FSGS_gene,romics_glomeruli_adult_Uniprot$IDs[,c(2,1)],by.x=1,by.y=1,all = T)
+down_FSGS_gene<-down_FSGS_gene[down_FSGS_gene$UniprotID %in% down_FSGS,]
+
+write.table(up_FSGS_gene,file = "03_output_files/33_up_FSGS_Adult.txt",sep = "\t",row.names = F)
+write.table(down_FSGS_gene,file = "03_output_files/34_down_FSGS_Adult.txt",sep = "\t",row.names = F)
+
+# MN
+up_MN_adult<-rownames(romics_glomeruli_adult_Uniprot$statistics)[(
+  romics_glomeruli_adult_Uniprot$statistics$Glomeruli_Normal_Adult_vs_Glomeruli_MN_Adult_glmBionomialTest_padj<0.05&
+    romics_glomeruli_adult_Uniprot$statistics$Glomeruli_Normal_Adult_vs_Glomeruli_MN_Adult_directionality==-1)|
+    (!is.na(romics_glomeruli_adult_Uniprot$statistics$Glomeruli_MN_Adult_vs_Glomeruli_Normal_Adult_Ttest_padj)& romics_glomeruli_adult_Uniprot$statistics$Glomeruli_MN_Adult_vs_Glomeruli_Normal_Adult_Ttest_padj<0.05&
+       romics_glomeruli_adult_Uniprot$statistics$`log(Glomeruli_MN_Adult/Glomeruli_Normal_Adult)`>0)]
+
+down_MN_adult<-rownames(romics_glomeruli_adult_Uniprot$statistics)[(
+  romics_glomeruli_adult_Uniprot$statistics$Glomeruli_Normal_Adult_vs_Glomeruli_MN_Adult_glmBionomialTest_padj<0.05&
+    romics_glomeruli_adult_Uniprot$statistics$Glomeruli_Normal_Adult_vs_Glomeruli_MN_Adult_directionality==1)|
+    (!is.na(romics_glomeruli_adult_Uniprot$statistics$Glomeruli_MN_Adult_vs_Glomeruli_Normal_Adult_Ttest_padj)& romics_glomeruli_adult_Uniprot$statistics$Glomeruli_MN_Adult_vs_Glomeruli_Normal_Adult_Ttest_padj<0.05&
+       romics_glomeruli_adult_Uniprot$statistics$`log(Glomeruli_MN_Adult/Glomeruli_Normal_Adult)`<0)]
+
+#we will now eliminate the gene present in both lists (ambigous calls)
+up_MN<-up_MN_adult[!up_MN_adult %in% down_MN_adult]
+down_MN<-down_MN_adult[!down_MN_adult %in% up_MN_adult]
+
+# append the gene names
+up_MN_gene<-data.frame(UniprotID = up_MN)
+up_MN_gene<-merge(up_MN_gene,romics_glomeruli_adult_Uniprot$IDs[,c(2,1)],by.x=1,by.y=1,all = T)
+up_MN_gene<-up_MN_gene[up_MN_gene$UniprotID %in% up_MN,]
+
+down_MN_gene<-data.frame(UniprotID = down_MN)
+down_MN_gene<-merge(down_MN_gene,romics_glomeruli_adult_Uniprot$IDs[,c(2,1)],by.x=1,by.y=1,all = T)
+down_MN_gene<-down_MN_gene[down_MN_gene$UniprotID %in% down_MN,]
+
+
+write.table(up_MN_gene,file = "03_output_files/35_up_MN_Adult.txt",sep = "\t",row.names = F)
+write.table(down_MN_gene,file = "03_output_files/36_down_MN_Adult.txt",sep = "\t",row.names = F)
+
+up_all<-up_AS[up_AS %in% up_FSGS & up_AS %in% up_MN]
+up_all<-data.frame(UniprotID = up_all)
+up_all_gene<-merge(up_all,romics_glomeruli_adult_Uniprot$IDs[,c(2,1)],by.x=1,by.y=1)
+write.table(up_all_gene,file = "03_output_files/40_up_all.txt",sep = "\t",row.names = F)
+
+up_AS_FSGS_only<-up_AS[up_AS %in% up_FSGS & !up_AS %in% up_MN]
+up_AS_FSGS_only<-data.frame(UniprotID = up_AS_FSGS_only)
+up_AS_FSGS_only_gene<-merge(up_AS_FSGS_only,romics_glomeruli_adult_Uniprot$IDs[,c(2,1)],by.x=1,by.y=1)
+write.table(up_AS_FSGS_only_gene,file = "03_output_files/41_up_AS_FSGS_only.txt",sep = "\t",row.names = F)
+
+up_AS_MN_only<-up_AS[up_AS %in% up_MN & !up_AS %in% up_FSGS]
+up_AS_MN_only<-data.frame(UniprotID = up_AS_MN_only)
+up_AS_MN_only_gene<-merge(up_AS_MN_only,romics_glomeruli_adult_Uniprot$IDs[,c(2,1)],by.x=1,by.y=1)
+write.table(up_AS_MN_only_gene,file = "03_output_files/42_up_AS_MN_only.txt",sep = "\t",row.names = F)
+
+up_MN_FSGS_only<-up_MN[up_MN %in% up_FSGS & !up_MN %in% up_AS]
+up_MN_FSGS_only<-data.frame(UniprotID = up_MN_FSGS_only)
+up_MN_FSGS_only_gene<-merge(up_MN_FSGS_only,romics_glomeruli_adult_Uniprot$IDs[,c(2,1)],by.x=1,by.y=1)
+write.table(up_MN_FSGS_only_gene,file = "03_output_files/43_up_MN_FSGS_only.txt",sep = "\t",row.names = F)
+
+up_AS_only<-up_AS[!up_AS %in% up_FSGS & !up_AS %in% up_MN]
+up_AS_only<-data.frame(UniprotID = up_AS_only)
+up_AS_only_gene<-merge(up_AS_only,romics_glomeruli_adult_Uniprot$IDs[,c(2,1)],by.x=1,by.y=1)
+write.table(up_AS_only_gene,file = "03_output_files/44_up_AS_only.txt",sep = "\t",row.names = F)
+
+up_FSGS_only<-up_FSGS[!up_FSGS %in% up_AS & !up_FSGS %in% up_MN]
+up_FSGS_only<-data.frame(UniprotID = up_FSGS_only)
+up_FSGS_only_gene<-merge(up_FSGS_only,romics_glomeruli_adult_Uniprot$IDs[,c(2,1)],by.x=1,by.y=1)
+write.table(up_FSGS_only_gene,file = "03_output_files/45_up_FSGS_only.txt",sep = "\t",row.names = F)
+
+up_MN_only<-up_MN[!up_MN %in% up_AS & !up_MN %in% up_FSGS]
+up_MN_only<-data.frame(UniprotID = up_MN_only)
+up_MN_only_gene<-merge(up_MN_only,romics_glomeruli_adult_Uniprot$IDs[,c(2,1)],by.x=1,by.y=1)
+write.table(up_MN_only_gene,file = "03_output_files/46_up_MN_only.txt",sep = "\t",row.names = F)
+
+down_all<-down_AS[down_AS %in% down_FSGS & down_AS %in% down_MN]
+down_all<-data.frame(UniprotID = down_all)
+down_all_gene<-merge(down_all,romics_glomeruli_adult_Uniprot$IDs[,c(2,1)],by.x=1,by.y=1)
+write.table(down_all_gene,file = "03_output_files/47_down_all.txt",sep = "\t",row.names = F)
+
+down_AS_FSGS_only<-down_AS[down_AS %in% down_FSGS & !down_AS %in% down_MN]
+down_AS_FSGS_only<-data.frame(UniprotID = down_AS_FSGS_only)
+down_AS_FSGS_only_gene<-merge(down_AS_FSGS_only,romics_glomeruli_adult_Uniprot$IDs[,c(2,1)],by.x=1,by.y=1)
+write.table(down_AS_FSGS_only_gene,file = "03_output_files/48_down_AS_FSGS_only.txt",sep = "\t",row.names = F)
+
+down_AS_MN_only<-down_AS[down_AS %in% down_MN & !down_AS %in% down_FSGS]
+down_AS_MN_only<-data.frame(UniprotID = down_AS_MN_only)
+down_AS_MN_only_gene<-merge(down_AS_MN_only,romics_glomeruli_adult_Uniprot$IDs[,c(2,1)],by.x=1,by.y=1)
+write.table(down_AS_MN_only_gene,file = "03_output_files/49_down_AS_MN_only.txt",sep = "\t",row.names = F)
+
+down_MN_FSGS_only<-down_MN[down_MN %in% down_FSGS & !down_MN %in% down_AS]
+down_MN_FSGS_only<-data.frame(UniprotID = down_MN_FSGS_only)
+down_MN_FSGS_only_gene<-merge(down_MN_FSGS_only,romics_glomeruli_adult_Uniprot$IDs[,c(2,1)],by.x=1,by.y=1)
+write.table(down_MN_FSGS_only_gene,file = "03_output_files/50_down_MN_FSGS_only.txt",sep = "\t",row.names = F)
+
+down_AS_only<-down_AS[!down_AS %in% down_FSGS & !down_AS %in% down_MN]
+down_AS_only<-data.frame(UniprotID = down_AS_only)
+down_AS_only_gene<-merge(down_AS_only,romics_glomeruli_adult_Uniprot$IDs[,c(2,1)],by.x=1,by.y=1)
+write.table(down_AS_only_gene,file = "03_output_files/51_down_AS_only.txt",sep = "\t",row.names = F)
+
+down_FSGS_only<-down_FSGS[!down_FSGS %in% down_AS & !down_FSGS %in% down_MN]
+down_FSGS_only<-data.frame(UniprotID = down_FSGS_only)
+down_FSGS_only_gene<-merge(down_FSGS_only,romics_glomeruli_adult_Uniprot$IDs[,c(2,1)],by.x=1,by.y=1)
+write.table(down_FSGS_only_gene,file = "03_output_files/52_down_FSGS_only.txt",sep = "\t",row.names = F)
+
+down_MN_only<-down_MN[!down_MN %in% down_AS & !down_MN %in% down_FSGS]
+down_MN_only<-data.frame(UniprotID = down_MN_only)
+down_MN_only_gene<-merge(down_MN_only,romics_glomeruli_adult_Uniprot$IDs[,c(2,1)],by.x=1,by.y=1)
+write.table(down_MN_only_gene,file = "03_output_files/53_down_MN_only.txt",sep = "\t",row.names = F)
+
+up_AS_FSGS<-up_AS[up_AS %in% up_FSGS]
+up_AS_FSGS<-data.frame(UniprotID = up_AS_FSGS)
+up_AS_FSGS_gene<-merge(up_AS_FSGS,romics_glomeruli_adult_Uniprot$IDs[,c(2,1)],by.x=1,by.y=1)
+write.table(up_AS_FSGS_gene,file = "03_output_files/54_up_AS_FSGS.txt",sep = "\t",row.names = F)
+
+down_AS_FSGS<-down_AS[down_AS %in% down_FSGS]
+down_AS_FSGS<-data.frame(UniprotID = down_AS_FSGS)
+down_AS_FSGS_gene<-merge(down_AS_FSGS,romics_glomeruli_adult_Uniprot$IDs[,c(2,1)],by.x=1,by.y=1)
+write.table(down_AS_FSGS_gene,file = "03_output_files/55_down_AS_FSGS.txt",sep = "\t",row.names = F)
+
+up_AS_only_vs_FSGS<-up_AS[!up_AS %in% up_FSGS]
+up_AS_only_vs_FSGS<-data.frame(UniprotID = up_AS_only_vs_FSGS)
+up_AS_only_vs_FSGS_gene<-merge(up_AS_only_vs_FSGS,romics_glomeruli_adult_Uniprot$IDs[,c(2,1)],by.x=1,by.y=1)
+write.table(up_AS_only_vs_FSGS_gene,file = "03_output_files/56_up_AS_only_vs_FSGS.txt",sep = "\t",row.names = F)
+
+down_AS_only_vs_FSGS<-down_AS[!down_AS %in% down_FSGS]
+down_AS_only_vs_FSGS<-data.frame(UniprotID = down_AS_only_vs_FSGS)
+down_AS_only_vs_FSGS_gene<-merge(down_AS_only_vs_FSGS,romics_glomeruli_adult_Uniprot$IDs[,c(2,1)],by.x=1,by.y=1)
+write.table(down_AS_only_vs_FSGS_gene,file = "03_output_files/57_down_AS_only_vs_FSGS.txt",sep = "\t",row.names = F)
+
+up_FSGS_only_vs_AS<-up_FSGS[!up_AS %in% up_FSGS]
+up_FSGS_only_vs_AS<-data.frame(UniprotID = up_FSGS_only_vs_AS)
+up_FSGS_only_vs_AS_gene<-merge(up_FSGS_only_vs_AS,romics_glomeruli_adult_Uniprot$IDs[,c(2,1)],by.x=1,by.y=1)
+write.table(up_FSGS_only_vs_AS_gene,file = "03_output_files/58_up_FSGS_only_vs_AS.txt",sep = "\t",row.names = F)
+
+down_FSGS_only_vs_AS<-down_FSGS[!down_AS %in% down_FSGS]
+down_FSGS_only_vs_AS<-data.frame(UniprotID = down_FSGS_only_vs_AS)
+down_FSGS_only_vs_AS_gene<-merge(down_FSGS_only_vs_AS,romics_glomeruli_adult_Uniprot$IDs[,c(2,1)],by.x=1,by.y=1)
+write.table(down_FSGS_only_vs_AS_gene,file = "03_output_files/59_down_FSGS_only_vs_AS.txt",sep = "\t",row.names = F)
+
+list_3ways_up<- list(up_AS=as.character(t(up_AS)),up_FSGS=as.character(t(up_FSGS)), up_MN=as.character(t(up_MN)))
+ggvenn(list_3ways_up, c("up_AS","up_FSGS","up_MN"))
+
+list_3ways_down<- list(down_AS=as.character(t(down_AS)),down_FSGS=as.character(t(down_FSGS)), down_MN=as.character(t(down_MN)))
+ggvenn(list_3ways_down, c("down_AS","down_FSGS","down_MN"))
+
+#now all enrichments will be performed for the three way venn diagram
+
+up_all_enr<-cbind(enriched_in="up_all",Enrich_EASE(as.character(t(up_all)),universe))
+up_AS_FSGS_only_enr<-cbind(enriched_in="up_AS_FSGS_only",Enrich_EASE(as.character(t(up_AS_FSGS_only)),universe))
+up_AS_MN_only_enr<-cbind(enriched_in="up_AS_MN_only",Enrich_EASE(as.character(t(up_AS_MN_only)),universe))
+up_MN_FSGS_only_enr<-cbind(enriched_in="up_MN_FSGS_only",Enrich_EASE(as.character(t(up_MN_FSGS_only)),universe))
+
+up_AS_only_enr<-cbind(enriched_in="up_AS_only",Enrich_EASE(as.character(t(up_AS_only)),universe))
+up_FSGS_only_enr<-cbind(enriched_in="up_FSGS_only",Enrich_EASE(as.character(t(up_FSGS_only)),universe))
+up_MN_only_enr<-cbind(enriched_in="up_MN_only",Enrich_EASE(as.character(t(up_MN_only)),universe))
+
+down_all_enr<-cbind(enriched_in="down_all",Enrich_EASE(as.character(t(down_all)),universe))
+down_AS_FSGS_only_enr<-cbind(enriched_in="down_AS_FSGS_only",Enrich_EASE(as.character(t(down_AS_FSGS_only)),universe))
+down_AS_MN_only_enr<-cbind(enriched_in="down_AS_MN_only",Enrich_EASE(as.character(t(down_AS_MN_only)),universe))
+down_MN_FSGS_only_enr<-cbind(enriched_in="down_MN_FSGS_only",Enrich_EASE(as.character(t(down_MN_FSGS_only)),universe))
+
+down_AS_only_enr<-cbind(enriched_in="down_AS_only",Enrich_EASE(as.character(t(down_AS_only)),universe))
+down_FSGS_only_enr<-cbind(enriched_in="down_FSGS_only",Enrich_EASE(as.character(t(down_FSGS_only)),universe))
+down_MN_only_enr<-cbind(enriched_in="down_MN_only",Enrich_EASE(as.character(t(down_MN_only)),universe))
+
+enrichments<-enrfilter(rbind(up_all_enr,up_AS_FSGS_only_enr,up_AS_MN_only_enr,up_MN_FSGS_only_enr,up_AS_only_enr,up_FSGS_only_enr,up_MN_only_enr,down_all_enr,down_AS_FSGS_only_enr,down_AS_MN_only_enr,down_MN_FSGS_only_enr,down_AS_only_enr,down_FSGS_only_enr,down_MN_only_enr),pval_type = "pval",foldchange = 1,min_feature = 2)
+
+write.csv(enrichments,file = "03_output_files/60_enrichments_venn_3_ways.csv",row.names = F)
+
+#now two ways venn will be performed between AS and FSGS
+list_2ways_up<- list(up_AS=as.character(t(up_AS)),up_FSGS=as.character(t(up_FSGS)))
+ggvenn(list_2ways_up, c("up_AS","up_FSGS"))
+
+list_2ways_down<- list(down_AS=as.character(t(down_AS)),down_FSGS=as.character(t(down_FSGS)))
+ggvenn(list_2ways_down, c("down_AS","down_FSGS"))
+
+up_AS_FSGS_enr<-cbind(enriched_in="up_AS_FSGS",Enrich_EASE(as.character(t(up_AS_FSGS)),universe))
+down_AS_FSGS_enr<-cbind(enriched_in="down_AS_FSGS",Enrich_EASE(as.character(t(down_AS_FSGS)),universe))
+
+up_AS_only_vs_FSGS_enr<-cbind(enriched_in="up_AS_only_vs_FSGS",Enrich_EASE(as.character(t(up_AS_only_vs_FSGS)),universe))
+down_AS_only_vs_FSGS_enr<-cbind(enriched_in="down_AS_only_vs_FSGS",Enrich_EASE(as.character(t(down_AS_only_vs_FSGS)),universe))
+
+up_FSGS_only_vs_AS_enr<-cbind(enriched_in="up_FSGS_only_vs_AS",Enrich_EASE(as.character(t(up_FSGS_only_vs_AS)),universe))
+down_FSGS_only_vs_AS_enr<-cbind(enriched_in="down_FSGS_only_vs_AS",Enrich_EASE(as.character(t(down_FSGS_only_vs_AS)),universe))
+
+enrichments<-enrfilter(rbind(up_AS_FSGS_enr,down_AS_FSGS_enr,up_AS_only_vs_FSGS_enr,down_AS_only_vs_FSGS_enr,up_FSGS_only_vs_AS_enr,down_FSGS_only_vs_AS_enr),pval_type = "pval",foldchange = 1,min_feature = 2)
+
+write.csv(enrichments,file = "03_output_files/61_enrichments_venn_2_ways.csv",row.names = F)
+```
+
+# Trend Analyses
+First we did evaluate the genes following linear trend with the pathology scores for all glomeruli
+```{r Trend_analysis_glomeruli}
+romics_glomeruli_imp_Fadi<-romicsTrend(romics_glomeruli_imp,factor = "Pathology_Score_FADI_plus_one" ,log_factor = T,p = 0.05,type = "linear")
+
+romics_glomeruli_imp_Fadi<-romicsChangeFactor(romics_glomeruli_imp_Fadi,main_factor = "Pathology_Score_Fadi")
+romics_glomeruli_imp_Fadi<-romicsZscores(romics_glomeruli_imp_Fadi)
+#romicsTrendHeatmap(romics_glomeruli_imp_Nast)
+#romicsTrendHeatmap(romics_glomeruli_imp_Fadi)
+write.csv(romicsExportData(romics_glomeruli_imp_Fadi,statistics = T,missing_data = T,IDs = T),file = "03_output_files/62_glomeruli_imp_TREND_fadi_all_gloms.csv")
+
+#enrichment analysis was performed on the FADI trends
+fadi_uniprot<-romicsChangeIDs(romics_glomeruli_imp_Fadi,newIDs ="Uniprot_accession")
+linear_down<-rownames(fadi_uniprot$statistics)[fadi_uniprot$statistics$best_fitted_trend=="linear_decreasing"]
+linear_up<-rownames(fadi_uniprot$statistics)[fadi_uniprot$statistics$best_fitted_trend=="linear_increasing"]
+universe<-rownames(fadi_uniprot$statistics)
+
+linear_up<-cbind(trend="linear_increasing",Enrich_EASE(linear_up,universe))
+linear_down<-cbind(trend="linear_decreasing",Enrich_EASE(linear_down,universe))
+
+trend_fadi_enrichment <-enrfilter(rbind(linear_up,linear_down),pval_type = "pval",foldchange = 1,min_feature = 2)
+write.table(trend_fadi_enrichment,file = "03_output_files/63_enrichment_trends_fadi_all_gloms.txt",sep="\t",row.names = F)
+```
+
+The same analysis was performed for 
+1- the young AS
+```{r Trend_analysis_Young_glomeruli}
+romics_glomeruli_imp_Fadi<-romicsTrend(romics_glomeruli_young_imp,factor = "Pathology_Score_FADI_plus_one" ,log_factor = T,p = 0.05,type = "linear")
+
+romics_glomeruli_imp_Fadi<-romicsChangeFactor(romics_glomeruli_imp_Fadi,main_factor = "Pathology_Score_Fadi")
+romics_glomeruli_imp_Fadi<-romicsZscores(romics_glomeruli_imp_Fadi)
+#romicsTrendHeatmap(romics_glomeruli_imp_Nast)
+#romicsTrendHeatmap(romics_glomeruli_imp_Fadi)
+write.csv(romicsExportData(romics_glomeruli_imp_Fadi,statistics = T,missing_data = T,IDs = T),file = "03_output_files/64_glomeruli_imp_TREND_fadi_AS_young.csv")
+
+#enrichment analysis was performed on the FADI trends
+fadi_uniprot<-romicsChangeIDs(romics_glomeruli_imp_Fadi,newIDs ="Uniprot_accession")
+linear_down<-rownames(fadi_uniprot$statistics)[fadi_uniprot$statistics$best_fitted_trend=="linear_decreasing"]
+linear_up<-rownames(fadi_uniprot$statistics)[fadi_uniprot$statistics$best_fitted_trend=="linear_increasing"]
+universe<-rownames(fadi_uniprot$statistics)
+
+linear_up<-cbind(trend="linear_increasing",Enrich_EASE(linear_up,universe))
+linear_down<-cbind(trend="linear_decreasing",Enrich_EASE(linear_down,universe))
+
+trend_fadi_enrichment <-enrfilter(rbind(linear_up,linear_down),pval_type = "pval",foldchange = 1,min_feature = 2)
+write.table(trend_fadi_enrichment,file = "03_output_files/65_enrichment_trends_fadi_AS_Young.txt",sep="\t",row.names = F)
+```
+
+2- the adult MN
+```{r Trend_analysis_MN_glomeruli}
+romics_glomeruli_adult_MN_imp<-romicsSubset(romics_glomeruli_imp, subset_vector = c("Glomeruli_MN_Adult","Glomeruli_Normal_Adult"),by = "level",factor = "structure_disease_age")
+
+romics_glomeruli_imp_Fadi<-romicsTrend(romics_glomeruli_adult_MN_imp,factor = "Pathology_Score_FADI_plus_one" ,log_factor = T,p = 0.05,type = "linear")
+
+romics_glomeruli_imp_Fadi<-romicsChangeFactor(romics_glomeruli_imp_Fadi,main_factor = "Pathology_Score_Fadi")
+romics_glomeruli_imp_Fadi<-romicsZscores(romics_glomeruli_imp_Fadi)
+#romicsTrendHeatmap(romics_glomeruli_imp_Nast)
+#romicsTrendHeatmap(romics_glomeruli_imp_Fadi)
+write.csv(romicsExportData(romics_glomeruli_imp_Fadi,statistics = T,missing_data = T,IDs = T),file = "03_output_files/66_glomeruli_imp_TREND_fadi_MN.csv")
+
+#enrichment analysis was performed on the FADI trends
+fadi_uniprot<-romicsChangeIDs(romics_glomeruli_imp_Fadi,newIDs ="Uniprot_accession")
+linear_down<-rownames(fadi_uniprot$statistics)[fadi_uniprot$statistics$best_fitted_trend=="linear_decreasing"]
+linear_up<-rownames(fadi_uniprot$statistics)[fadi_uniprot$statistics$best_fitted_trend=="linear_increasing"]
+universe<-rownames(fadi_uniprot$statistics)
+
+linear_up<-cbind(trend="linear_increasing",Enrich_EASE(linear_up,universe))
+linear_down<-cbind(trend="linear_decreasing",Enrich_EASE(linear_down,universe))
+
+trend_fadi_enrichment <-enrfilter(rbind(linear_up,linear_down),pval_type = "pval",foldchange = 1,min_feature = 2)
+write.table(trend_fadi_enrichment,file = "03_output_files/67_enrichment_trends_fadi_MN.txt",sep="\t",row.names = F)
+```
+
+3- the adult FSGS
+```{r Trend_analysis_FSGS_glomeruli}
+romics_glomeruli_adult_FSGS_imp<-romicsSubset(romics_glomeruli_imp, subset_vector = c("Glomeruli_FSGS_Adult","Glomeruli_Normal_Adult"),by = "level",factor = "structure_disease_age")
+
+romics_glomeruli_imp_Fadi<-romicsTrend(romics_glomeruli_adult_FSGS_imp,factor = "Pathology_Score_FADI_plus_one" ,log_factor = T,p = 0.05,type = "linear")
+
+romics_glomeruli_imp_Fadi<-romicsChangeFactor(romics_glomeruli_imp_Fadi,main_factor = "Pathology_Score_Fadi")
+romics_glomeruli_imp_Fadi<-romicsZscores(romics_glomeruli_imp_Fadi)
+#romicsTrendHeatmap(romics_glomeruli_imp_Nast)
+#romicsTrendHeatmap(romics_glomeruli_imp_Fadi)
+write.csv(romicsExportData(romics_glomeruli_imp_Fadi,statistics = T,missing_data = T,IDs = T),file = "03_output_files/68_glomeruli_imp_TREND_fadi_FSGS.csv")
+
+#enrichment analysis was performed on the FADI trends
+fadi_uniprot<-romicsChangeIDs(romics_glomeruli_imp_Fadi,newIDs ="Uniprot_accession")
+linear_down<-rownames(fadi_uniprot$statistics)[fadi_uniprot$statistics$best_fitted_trend=="linear_decreasing"]
+linear_up<-rownames(fadi_uniprot$statistics)[fadi_uniprot$statistics$best_fitted_trend=="linear_increasing"]
+universe<-rownames(fadi_uniprot$statistics)
+
+linear_up<-cbind(trend="linear_increasing",Enrich_EASE(linear_up,universe))
+linear_down<-cbind(trend="linear_decreasing",Enrich_EASE(linear_down,universe))
+
+trend_fadi_enrichment <-enrfilter(rbind(linear_up,linear_down),pval_type = "pval",foldchange = 1,min_feature = 2)
+write.table(trend_fadi_enrichment,file = "03_output_files/69_enrichment_trends_fadi_FSGS.txt",sep="\t",row.names = F)
+```
+
+
+# Correlation with Glomerular disease related proteins
+
+For a set of genes related to glomerular proteins (WT1, EHD3, NPHS1, NPHS2, CD2AP, PODXL,and PDGFRB) we performed correlation analysis to identify genes that were correlated and in their expression to the expression of these genes.
+
+first for the all glomeruli
+```{r plot_Subset06}
+ro<-romics_glomeruli_imp
+data<-ro$data
+ro_uniprot<-romicsChangeIDs(ro,newIDs ="Uniprot_accession")
+data_uniprot<-ro_uniprot$data
+
+WT1<-data[rownames(data)=="WT1",]
+EHD3<-data[rownames(data)=="EHD3",]
+NPHS1<-data[rownames(data)=="NPHS1",]
+NPHS2<-data[rownames(data)=="NPHS2",]
+CD2AP<-data[rownames(data)=="CD2AP",]
+PDGFRB<-data[rownames(data)=="PDGFRB",]
+PECAM1<-data[rownames(data)=="PECAM1",]
+#ACTA2<-data[rownames(data)=="ACTA2",]
+
+TEK<-data[rownames(data)=="TEK",]
+FLT1<-data[rownames(data)=="FLT1",]
+#RNE<-data[rownames(data)=="RNE",]
+CXCR4<-data[rownames(data)=="CXCR4",]
+CDH5<-data[rownames(data)=="CDH5",]
+
+CD44<-data[rownames(data)=="CD44",]
+GATA3<-data[rownames(data)=="GATA3",]
+ITGA8<-data[rownames(data)=="ITGA8",]
+
+table_genes=data.frame(WT1=t(WT1),
+                       EHD3=t(EHD3),
+                       NPHS1=t(NPHS1),
+                       NPHS2=t(NPHS2),
+                       CD2AP=t(CD2AP),
+                       PDGFRB=t(PDGFRB),
+                       PECAM1=t(PECAM1),
+                       #ACTA2=t(ACTA2),
+                       TEK=t(TEK),
+                       FLT1=t(FLT1),
+                       #RNE=t(RNE),
+                       CXCR4=t(CXCR4),
+                       CDH5=t(CDH5),
+                       CD44=t(CD44),
+                       GATA3=t(GATA3),
+                       ITGA8=t(ITGA8),
+                       Condition=as.character((romicsExtractFactor(ro,factor = ro$main_factor))))
+
+ggplot(table_genes,aes(x=WT1,y=Condition, fill=Condition))+geom_boxplot()+geom_jitter()+ggtitle("WT1")+theme_ROP()
+ggplot(table_genes,aes(x=EHD3,y=Condition, fill=Condition))+geom_boxplot()+geom_jitter()+ggtitle("EHD3")+theme_ROP()
+ggplot(table_genes,aes(x=NPHS1,y=Condition, fill=Condition))+geom_boxplot()+geom_jitter()+ggtitle("NPHS1")+theme_ROP()
+ggplot(table_genes,aes(x=NPHS2,y=Condition, fill=Condition))+geom_boxplot()+geom_jitter()+ggtitle("NPHS2")+theme_ROP()
+ggplot(table_genes,aes(x=CD2AP,y=Condition, fill=Condition))+geom_boxplot()+geom_jitter()+ggtitle("CD2AP")+theme_ROP()
+ggplot(table_genes,aes(x=PDGFRB,y=Condition,fill=Condition))+geom_boxplot()+geom_jitter()+ggtitle("PDGFRB")+theme_ROP()
+ggplot(table_genes,aes(x=PECAM1,y=Condition, fill=Condition))+geom_boxplot()+geom_jitter()+ggtitle("PECAM")+theme_ROP()
+#ggplot(table_genes,aes(x=ACTA2,y=Condition, fill=Condition))+geom_boxplot()+geom_jitter()+ggtitle("ACTA2")+theme_ROP()
+ggplot(table_genes,aes(x=TEK,y=Condition, fill=Condition))+geom_boxplot()+geom_jitter()+ggtitle("TEK")+theme_ROP()
+ggplot(table_genes,aes(x=FLT1,y=Condition, fill=Condition))+geom_boxplot()+geom_jitter()+ggtitle("FLT1")+theme_ROP()
+#ggplot(table_genes,aes(x=RNE,y=Condition, fill=Condition))+geom_boxplot()+geom_jitter()+ggtitle("RNE")+theme_ROP()
+ggplot(table_genes,aes(x=CXCR4,y=Condition, fill=Condition))+geom_boxplot()+geom_jitter()+ggtitle("CXCR4")+theme_ROP()
+ggplot(table_genes,aes(x=CDH5,y=Condition, fill=Condition))+geom_boxplot()+geom_jitter()+ggtitle("CDH5")+theme_ROP()
+ggplot(table_genes,aes(x=CD44,y=Condition,fill=Condition))+geom_boxplot()+geom_jitter()+ggtitle("CD44")+theme_ROP()
+ggplot(table_genes,aes(x=GATA3,y=Condition, fill=Condition))+geom_boxplot()+geom_jitter()+ggtitle("GATA3")+theme_ROP()
+ggplot(table_genes,aes(x=ITGA8,y=Condition, fill=Condition))+geom_boxplot()+geom_jitter()+ggtitle("ITGA8")+theme_ROP()
+
+#the correlation cutoff is set
+cutoff<-0.5
+
+print(paste0("The correlation cutoff was set to ", cutoff))
+
+for(j in 1:(ncol(table_genes)-1)){
+
+print(paste0("Correlation to ",colnames(table_genes)[j]," was calculated"))
+correlation<-numeric()
+
+for(i in 1:nrow(data)){
+  correlation[i]<-cor(as.numeric(table_genes[,j]),as.numeric(data[i,]),method = "pearson")
+}
+
+correlation<-data.frame(Pearson_correlation=as.numeric(correlation))
+correlation$Gene<-rownames(data)
+correlation$Uniprot<-rownames(data_uniprot)
+
+print(paste0("Enrichment analysis were then performed for ", colnames(table_genes)[j]))
+
+universe<-correlation$Uniprot
+correlated<- correlation$Uniprot[correlation$Pearson_correlation>cutoff]
+anticorrelated<- correlation$Uniprot[correlation$Pearson_correlation < -1*cutoff]
+
+if(length(correlated)>2){
+correlated_enr<-cbind(gene=colnames(table_genes)[j],enriched_in="correlated",  Enrich_EASE(correlated,universe))
+}else{correlated_enr<-t(data.frame(col=c(colnames(table_genes)[j],"correlated",rep(NA,13))))}
+colnames(correlated_enr)<-c("gene", "enriched_in",colnames(enrichment_AS_adult)[-1])
+
+if(length(anticorrelated)>2){
+anticorrelated_enr<-cbind(gene=colnames(table_genes)[j],enriched_in="anticorrelated",  Enrich_EASE(anticorrelated,universe))
+}else{anticorrelated_enr<-t(data.frame(col=c(colnames(table_genes)[j],"anticorrelated",rep(NA,13))))}
+colnames(anticorrelated_enr)<-c("gene", "enriched_in",colnames(enrichment_AS_adult)[-1])
+
+correlations_enr<-enrfilter(rbind(correlated_enr,anticorrelated_enr),pval_type = "pval",foldchange = 1,min_feature = 2)
+
+write.csv(correlations_enr,file = paste0("03_output_files/",69+3*j-2,"_Correlations_",colnames(table_genes)[j],"_all_gloms.csv"),row.names = F)
+
+correlated<-merge(data.frame(Uniprot=correlated),correlation,by="Uniprot")[,c(3,1,2)]
+anticorrelated<-merge(data.frame(Uniprot=anticorrelated),correlation,by="Uniprot")[,c(3,1,2)]
+write.csv(correlated,file = paste0("03_output_files/",69+3*j-1,"_Correlated_to_",colnames(table_genes)[j],"_all_gloms.csv"),row.names = F)
+write.csv(anticorrelated,file = paste0("03_output_files/",69+3*j,"_Anticorrelated_to_",colnames(table_genes)[j],"_all_gloms.csv"),row.names = F)
+
+print(ggplot(correlation,aes(x=Pearson_correlation))+geom_histogram(bins = 100,fill="gray10",alpha=0.9)+ggtitle(label = paste0(colnames(table_genes)[j]," correlation frequency plot"))+theme_ROP()+geom_vline(xintercept = cutoff, linetype="dotted",color="red")+ geom_vline(xintercept = -cutoff, linetype="dotted",color="blue"))
+}
+```
+
+# MN adult with different donors
+For MN the glomeruli from the two donor seemed to have relatively different transcriptomics profiles we therefore analyzed the data by separating the two donors.
+The data was filtered to contain at least 50% of values for a given group
+```{r missingness_filtering_glomeruli_MN_by_donor}
+romics_glomeruli_MN_by_donor<-romicsFilterMissing(romics_glomeruli_MN_Adult,percentage_completeness = 50)
+romics_glomeruli_MN_by_donor<-romicsChangeFactor(romics_glomeruli_MN_by_donor,"disease_gen")
+```
+
+The sample grouping was checked by h-clustering
+```{r Hclust_glomeruli_MN_by_donor}
+romicsHclust(romics_glomeruli_MN_by_donor)
+```
+
+and then by PCA
+```{r PCA_glomeruli_MN_by_donor}
+romics_glomeruli_MN_by_donor_imp<-romicsChangeFactor(romics_glomeruli_MN_Adult_imp,"disease_gen")
+
+indPCAplot(romics_glomeruli_MN_by_donor_imp,label = F,Xcomp = 1,Ycomp = 2,plotType = "individual")
+indPCAplot(romics_glomeruli_MN_by_donor_imp,label = F,Xcomp = 1,Ycomp = 3,plotType = "individual")
+
+indPCA3D(romics_glomeruli_MN_by_donor_imp, Xcomp = 1,Ycomp = 2,Zcomp = 3)
+```
+
+General statistics were performed
+```{r general_statistics_glomeruli_MN_by_donor}
+romics_glomeruli_MN_by_donor<-romicsMean(romics_glomeruli_MN_by_donor)
+romics_glomeruli_MN_by_donor<-romicsSd(romics_glomeruli_MN_by_donor)
+romics_glomeruli_MN_by_donor<-romicsGlmBinomial(romics_glomeruli_MN_by_donor)
+romics_glomeruli_MN_by_donor<-romicsTtest(romics_glomeruli_MN_by_donor,var.equal = F,percentage_completeness = 50)
+romics_glomeruli_MN_by_donor<-romicsTtest(romics_glomeruli_MN_by_donor,var.equal = F,percentage_completeness = 50,reverse_order = T)
+```
+
+The volcano plots were displayed
+```{r volcanoes_glomeruli_MN_by_donor}
+romicsVolcano(romics_glomeruli_MN_by_donor,p_type = "padj",min_fold_change = 0,p = 0.05, plot_type = "ggplot")
+```
+```{r enrichment_glomeruli_MN_by_donor}
+romics_glomeruli_MN_by_donor_uniprot<-romicsChangeIDs(romics_glomeruli_MN_by_donor,newIDs = "Uniprot_accession")
+
+universe<-rownames(romics_glomeruli_MN_by_donor_uniprot$statistics)
+
+up_in_MNF_vs_Ctrl<-rownames(romics_glomeruli_MN_by_donor_uniprot$statistics)[
+      !is.na(romics_glomeruli_MN_by_donor_uniprot$statistics$`MN_F_vs_Normal _Adult_Ttest_padj`) &
+      romics_glomeruli_MN_by_donor_uniprot$statistics$`MN_F_vs_Normal _Adult_Ttest_padj`<0.05 &
+      romics_glomeruli_MN_by_donor_uniprot$statistics$`log(MN_F/Normal _Adult)`>0|
+      romics_glomeruli_MN_by_donor_uniprot$statistics$`Normal _Adult_vs_MN_F_glmBionomialTest_padj`<0.05 &
+      romics_glomeruli_MN_by_donor_uniprot$statistics$`Normal _Adult_vs_MN_F_directionality`==-1]
+                                                                             
+down_in_MNF_vs_Ctrl<-rownames(romics_glomeruli_MN_by_donor_uniprot$statistics)[
+      !is.na(romics_glomeruli_MN_by_donor_uniprot$statistics$`MN_F_vs_Normal _Adult_Ttest_padj`) &
+      romics_glomeruli_MN_by_donor_uniprot$statistics$`MN_F_vs_Normal _Adult_Ttest_padj`<0.05 &
+      romics_glomeruli_MN_by_donor_uniprot$statistics$`log(MN_F/Normal _Adult)`<0|
+      romics_glomeruli_MN_by_donor_uniprot$statistics$`Normal _Adult_vs_MN_F_glmBionomialTest_padj`<0.05 &
+      romics_glomeruli_MN_by_donor_uniprot$statistics$`Normal _Adult_vs_MN_F_directionality`==1]
+
+
+up_MNF<- up_in_MNF_vs_Ctrl[!up_in_MNF_vs_Ctrl %in% down_in_MNF_vs_Ctrl]
+down_MNF<- down_in_MNF_vs_Ctrl[!down_in_MNF_vs_Ctrl %in% up_in_MNF_vs_Ctrl]
+
+up_MNF_enr<-cbind(category="up_in_MNF_vs_Normal",enrfilter(Enrich_EASE(up_MNF,universe),pval_type = "pval",foldchange = 1,min_feature = 2))
+down_MNF_enr<-cbind(category="down_in_MNF_vs_Normal",enrfilter(Enrich_EASE(down_MNF,universe),pval_type = "pval",foldchange = 1,min_feature = 2))
+
+up_in_MNM_vs_Ctrl<-rownames(romics_glomeruli_MN_by_donor_uniprot$statistics)[
+      !is.na(romics_glomeruli_MN_by_donor_uniprot$statistics$`MN_M_vs_Normal _Adult_Ttest_padj`) &
+      romics_glomeruli_MN_by_donor_uniprot$statistics$`MN_M_vs_Normal _Adult_Ttest_padj`<0.05 &
+      romics_glomeruli_MN_by_donor_uniprot$statistics$`log(MN_M/Normal _Adult)`>0|
+      romics_glomeruli_MN_by_donor_uniprot$statistics$`Normal _Adult_vs_MN_M_glmBionomialTest_padj`<0.05 &
+      romics_glomeruli_MN_by_donor_uniprot$statistics$`Normal _Adult_vs_MN_M_directionality`==-1]
+                                                                             
+down_in_MNM_vs_Ctrl<-rownames(romics_glomeruli_MN_by_donor_uniprot$statistics)[
+      !is.na(romics_glomeruli_MN_by_donor_uniprot$statistics$`MN_M_vs_Normal _Adult_Ttest_padj`) &
+      romics_glomeruli_MN_by_donor_uniprot$statistics$`MN_M_vs_Normal _Adult_Ttest_padj`<0.05 &
+      romics_glomeruli_MN_by_donor_uniprot$statistics$`log(MN_M/Normal _Adult)`<0|
+      romics_glomeruli_MN_by_donor_uniprot$statistics$`Normal _Adult_vs_MN_M_glmBionomialTest_padj`<0.05 &
+      romics_glomeruli_MN_by_donor_uniprot$statistics$`Normal _Adult_vs_MN_M_directionality`==1]
+
+
+up_MNM<- up_in_MNM_vs_Ctrl[!up_in_MNM_vs_Ctrl %in% down_in_MNM_vs_Ctrl]
+down_MNM<- down_in_MNM_vs_Ctrl[!down_in_MNM_vs_Ctrl %in% up_in_MNM_vs_Ctrl]
+
+up_MNM_enr<-cbind(category="up_in_MNM_vs_Normal",enrfilter(Enrich_EASE(up_MNM,universe),pval_type = "pval",foldchange = 1,min_feature = 2))
+down_MNM_enr<-cbind(category="down_in_MNM_vs_Normal",enrfilter(Enrich_EASE(down_MNM,universe),pval_type = "pval",foldchange = 1,min_feature = 2))
+
+enrichment_MN_by_sex<-rbind(up_MNF_enr,down_MNF_enr,up_MNM_enr,down_MNM_enr)
+  
+write.table(enrichment_MN_by_sex,file = "03_output_files/112_enrichment_MNF_or_MNM_vs_normal_enrichment.txt",sep="\t",row.names = F)
+```
+
+For this subset we performed a trajectory analysis using the package SLICER
+```{r Trajectory_glomeruli_MN_by_donor}
+table_glomeruli_MN_by_donor<-t(romicsSampleNameFromFactor(romics_glomeruli_MN_by_donor_imp,factor = "disease_gen_ROI")$data)
+genes <- select_genes(table_glomeruli_MN_by_donor)
+k = select_k(table_glomeruli_MN_by_donor[,genes], kmin=5)
+traj_lle = lle(table_glomeruli_MN_by_donor[,genes], m=2, k)$Y
+
+print("the points of the trajectory are plotted")
+
+traj_graph = conn_knn_graph(traj_lle,5)
+ends = find_extreme_cells(traj_graph, traj_lle)
+start = 1
+
+print("The trajectory connections were plotted")
+
+distances = graph_process_distance(traj_graph,embedding = traj_lle,start = 1)
+
+traj_lle_for_graph = as.data.frame(traj_lle)
+colnames(traj_lle_for_graph) = c("Manifold_dim_1","Manifold_dim_2")
+traj_lle_for_graph$Manifold_dim_1 = as.numeric(traj_lle_for_graph$Manifold_dim_1)
+traj_lle_for_graph$Manifold_dim_2 = as.numeric(traj_lle_for_graph$Manifold_dim_2)
+traj_lle_for_graph<- cbind(ROI= rownames(table_glomeruli_MN_by_donor), disease_gen= t(romics_glomeruli_MN_by_donor_imp$metadata[10,]), traj_lle_for_graph, branches =  assign_branches(traj_graph,start = 1))
+
+print("The plots is colored by condition")
+
+traj_lle_for_graph<-cbind(traj_lle_for_graph,data.frame(disease_age_structure=t(romics_glomeruli_MN_by_donor_imp$metadata[13,])))
+
+ggplot(traj_lle_for_graph,aes(x=Manifold_dim_1,Manifold_dim_2,color=disease_gen))+ geom_point(size=1,)+ geom_text(label=traj_lle_for_graph$ROI)+theme_ROP()
+
+DT::datatable(traj_lle_for_graph)
+```
+
+## data export
+the data was exported
+```{r data_export_glomeruli_MN_by_donor}
+results_glomeruli_MN_by_donor<-romicsExportData(romics_glomeruli_MN_by_donor,statistics = T,missing_data = T,IDs = T)
+write.csv(results_glomeruli_MN_by_donor,file = "03_output_files/113_results_glomeruli_MN_by_donor_non_imputed.csv")
+```
