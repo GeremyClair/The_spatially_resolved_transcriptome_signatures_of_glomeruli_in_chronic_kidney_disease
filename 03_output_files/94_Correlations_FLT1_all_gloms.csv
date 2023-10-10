@@ -1,0 +1,5 @@
+"gene","enriched_in","Category","Term_accession","Term_description","Count_query","Pop_query","Count_universe","Pop_universe","%_query","%_universe","pval","adjpval","fold_change","Proteins_in_query"
+"FLT1","correlated","GO_BP","0061484","hematopoietic stem cell homeostasis ","2","17","14","7049","5.88235294117647","0.198609731876862","0.0351542089664744","1","29.6176470588235","O43236;Q9ULC0"
+"FLT1","correlated","GO_CC","0005912","adherens junction ","3","17","99","7049","11.7647058823529","1.40445453255781","0.0234614017004649","0.808095731967518","8.3767082590612","O14495;Q12965;Q96AP7"
+"FLT1","correlated","GO_CC","0005925","focal adhesion ","4","17","302","7049","17.6470588235294","4.28429564477231","0.0336312886108215","0.808095731967518","4.11901051811453","P11717;P17948;Q63HR2;Q68CZ2"
+"FLT1","correlated","GO_CC","0030425","dendrite ","3","17","145","7049","11.7647058823529","2.0570293658675","0.0467695319244545","0.808095731967518","5.71926977687627","O43236;P24387;Q63HR2"

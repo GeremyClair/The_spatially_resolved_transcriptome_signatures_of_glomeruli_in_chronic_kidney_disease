@@ -1,0 +1,6 @@
+"gene","enriched_in","Category","Term_accession","Term_description","Count_query","Pop_query","Count_universe","Pop_universe","%_query","%_universe","pval","adjpval","fold_change","Proteins_in_query"
+"ITGA8","correlated","GO_BP","0000380","alternative mRNA splicing, via spliceosome ","3","16","17","7049","12.5","0.24116896013619","0.000787437916668465","0.123627752916949","51.8308823529412","P17844;P23246;Q13247"
+"ITGA8","correlated","GO_BP","0006376","mRNA splice site selection ","2","16","14","7049","6.25","0.198609731876862","0.0331232397178773","1","31.46875","Q13247;Q9Y383"
+"ITGA8","correlated","GO_BP","0002218","activation of innate immune response ","2","16","16","7049","6.25","0.226982550716414","0.0374611321076352","1","27.53515625","P13010;P23246"
+"ITGA8","correlated","GO_CC","0016607","nuclear speck ","4","16","239","7049","18.75","3.39055185132643","0.0155290849267244","1","5.53007322175732","P17844;P23246;Q13247;Q9Y383"
+"ITGA8","correlated","GO_MF","0036002","pre-mRNA binding ","2","16","7","7049","6.25","0.099304865938431","0.0177958509435634","0.99656765283955","62.9375","P17844;Q13247"

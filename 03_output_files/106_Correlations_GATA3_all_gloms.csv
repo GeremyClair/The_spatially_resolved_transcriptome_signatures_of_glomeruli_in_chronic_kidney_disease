@@ -1,0 +1,8 @@
+"gene","enriched_in","Category","Term_accession","Term_description","Count_query","Pop_query","Count_universe","Pop_universe","%_query","%_universe","pval","adjpval","fold_change","Proteins_in_query"
+"GATA3","correlated","GO_BP","0043627","response to estrogen ","3","11","20","7049","18.1818181818182","0.283728188395517","0.000490872052001269","0.121245396844313","64.0818181818182","P09619;P23771;P24385"
+"GATA3","correlated","GO_BP","0007165","signal transduction ","4","11","374","7049","27.2727272727273","5.30571712299617","0.0175779692663879","1","5.14025279533301","P09619;P23771;P55196;Q70E73"
+"GATA3","correlated","GO_BP","0045087","innate immune response ","3","11","165","7049","18.1818181818182","2.34075755426302","0.0260718579419612","1","7.76749311294766","P08174;P23771;Q9P2E3"
+"GATA3","correlated","GO_CC","0005886","plasma membrane ","7","11","1639","7049","54.5454545454545","23.2515250390126","0.0232909427374393","1","2.34588718176272","P08174;P09619;P55196;Q5T4S7;Q70E73;Q9UPT5;Q99805"
+"GATA3","correlated","GO_CC","0101003","ficolin-1-rich granule membrane ","2","11","29","7049","9.09090909090909","0.4114058731735","0.0453218044805403","1","22.0971786833856","P08174;Q5T4S7"
+"GATA3","correlated","KEGG_pathway","hsa05416","Viral myocarditis - Homo sapiens (human)","2","11","16","7049","9.09090909090909","0.226982550716414","0.0259167732687089","1","40.0511363636364","P08174;P24385"
+"GATA3","correlated","KEGG_pathway","hsa05165","Human papillomavirus infection - Homo sapiens (human)","3","11","174","7049","18.1818181818182","2.468435239041","0.0287482421599977","1","7.36572622779519","Q5T4S7;P09619;P24385"

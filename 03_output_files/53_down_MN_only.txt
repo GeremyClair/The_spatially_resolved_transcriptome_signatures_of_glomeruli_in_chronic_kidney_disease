@@ -1,0 +1,6 @@
+"UniprotID"	"original"
+"O75319"	"DUSP11"
+"P14384"	"CPM"
+"P32780"	"GTF2H1"
+"P80294"	"MT1H"
+"Q9BYG3"	"NIFK"

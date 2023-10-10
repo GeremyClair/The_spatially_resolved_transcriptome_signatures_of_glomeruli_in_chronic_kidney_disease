@@ -1,0 +1,4 @@
+"gene","enriched_in","Category","Term_accession","Term_description","Count_query","Pop_query","Count_universe","Pop_universe","%_query","%_universe","pval","adjpval","fold_change","Proteins_in_query"
+"CXCR4","correlated","GO_BP","0009611","response to wounding ","3","48","35","7049","4.16666666666667","0.496524329692155","0.0251726900684832","1","8.39166666666667","P48431;Q02535;Q9NVK5"
+"CXCR4","correlated","GO_BP","0070987","error-free translesion synthesis ","2","48","3","7049","2.08333333333333","0.0425592282593276","0.0265087085771207","1","48.9513888888889","P28340;Q96PM5"
+"CXCR4","correlated","KEGG_pathway","hsa04060","Cytokine-cytokine receptor interaction - Homo sapiens (human)","4","48","70","7049","6.25","0.99304865938431","0.0126104206961521","1","6.29375","Q14213;Q9UBH0;P61073;O14798"

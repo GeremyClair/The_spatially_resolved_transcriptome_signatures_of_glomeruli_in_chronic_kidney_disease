@@ -9,6 +9,15 @@ The R markdown and the knitR html report are located in the main folder of the r
 
 All the files generated during the data analysis are located in the folder 03_Output_files.
 
-Note that you can install [RomicsProcessor](https://github.com/PNNL-Comp-Mass-Spec/RomicsProcessor) on its dedicated repository.
-
+We used the following packages under their current version as of 10-09-2023 for the analyses
+- [ExperimentHub](https://bioconductor.org/packages/release/bioc/html/ExperimentHub.html) to create spatial data format compatible with StandR
+- [StandR](https://bioconductor.org/packages/release/bioc/html/standR.html) was used to evaluate the normalization method
+- [EdgeR](https://bioconductor.org/packages/release/bioc/html/edgeR.html) to perform the TMM normalization
+- [RomicsProcessor](https://github.com/PNNL-Comp-Mass-Spec/RomicsProcessor) to perform statistics and visualization of the data
+- [Protein-MiniOn] (https://github.com/GeremyClair/Protein_MiniOn) to perform enrichment analyses.
+- [Limma] (https://bioconductor.org/packages/release/bioc/html/limma.html) for some specific plots
+- [ggpubr] (https://cran.r-project.org/web/packages/ggpubr/index.html) for the visualization of transcript boxplot with values
+- [ggalluvial](https://cran.r-project.org/web/packages/ggalluvial/vignettes/ggalluvial.html) for the visualization of metadata
+- [scater] (https://bioconductor.org/packages/release/bioc/html/scater.html) for some map visualization
+- [DT] (https://rstudio.github.io/DT/) for the visualization of some tables
 Please let us know if you need any assistance in executing or understanding this code.
