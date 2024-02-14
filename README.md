@@ -1,7 +1,7 @@
 # The_spatially_resolved_transcriptome_signatures_of_glomeruli_in_chronic_kidney_disease
  Data analysis of the spatially resolved transcriptome for the paper by Geremy Clair et al.
 
-This repository contains the details of the GeoMX data analysis for the paper  titled : “The spatially resolved transcriptome signatures of glomeruli in chronic kidney disease“ by Hasmik Soloyan and collaborators. 
+This repository contains the details of the GeoMX data analysis for the paper  titled : “The spatially resolved transcriptome signatures of glomeruli in chronic kidney disease“ by Geremy Clair and collaborators. 
 
 The data was pre-processed using Nanostrings tools.
 
